@@ -8,7 +8,7 @@ from openpyxl.utils import get_column_letter
 app = Flask(__name__)
 CORS(app)
 
-DB = os.path.expanduser("~/asvs-pro/asvs.db")
+DB = os.path.expanduser("~/asvs-compliance-maturity-analyzer/asvs.db")
 
 def get_db():
     conn = sqlite3.connect(DB)
@@ -111,7 +111,7 @@ def export_excel():
     data = request.json
     results = data.get('categoryResults', {})
 
-    TEMPLATE = '/home/kali/asvs-pro/ASVS-checklist-en.xlsx'
+    TEMPLATE = '/home/kali/asvs-compliance-maturity-analyzer/ASVS-checklist-en.xlsx'
     if not os.path.exists(TEMPLATE):
         return jsonify({"error": "Template not found"}), 500
 
@@ -343,6 +343,11 @@ def export_excel():
         "Files and Resources":"Files and Resources",
     }
 
+    # Remove unwanted sheets
+    for remove_sheet in ["Architecture", "Malicious Code", "Business Logic"]:
+        if remove_sheet in wb.sheetnames:
+            del wb[remove_sheet]
+
     for cat, cat_data in results.items():
         sheet_name = sheet_map.get(cat)
         if not sheet_name or sheet_name not in wb.sheetnames:
@@ -352,10 +357,27 @@ def export_excel():
         # Hide NIST (col E) and Tool Used (col J)
         ws.column_dimensions["E"].hidden = True
         ws.column_dimensions["J"].hidden = True
+        ws.column_dimensions["J"].width = 0
+        # Set column widths
+        ws.column_dimensions["A"].width = 18
+        ws.column_dimensions["B"].width = 10
+        ws.column_dimensions["C"].width = 8
+        ws.column_dimensions["D"].width = 8
+        ws.column_dimensions["F"].width = 55
+        ws.column_dimensions["G"].width = 20
+        ws.column_dimensions["H"].width = 45
+        ws.column_dimensions["I"].width = 40
 
         req_map = {str(r.get("id","")).strip(): r for r in cat_data.get("reqs",[])}
 
         for row in ws.iter_rows(min_row=2):
+            ws.row_dimensions[row[0].row].height = 60
+            # Apply wrap text to ALL cells in row
+            for cell in row:
+                if cell.alignment:
+                    cell.alignment = AL(wrap_text=True, vertical="top", horizontal="left")
+                else:
+                    cell.alignment = AL(wrap_text=True, vertical="top", horizontal="left")
             req_id = str(row[1].value).strip() if row[1].value else ""
             if not req_id or req_id in ["None","nan",""]:
                 continue
@@ -366,15 +388,57 @@ def export_excel():
             valid_cell   = row[6]
             src_cell     = row[7]
             comment_cell = row[8]
+            cwe = str(req.get("cwe","")) if req and req.get("cwe") else ""
+            cwe_ref = f"CWE-{cwe} — https://cwe.mitre.org/data/definitions/{cwe}.html" if cwe else ""
 
-            if implemented:
+            wrong_impl = req.get("wrongImplementation", False) if req else False
+            # rmap for wrong implementation guidance
+            rmap = {
+                "2.4.1": ("Use bcrypt/argon2 for password storage", "Replace with bcrypt.hashpw(pwd.encode(), bcrypt.gensalt(12))"),
+                "2.4.4": ("Set bcrypt rounds >= 10", "Change cost factor to bcrypt.gensalt(rounds=12)"),
+                "3.4.1": ("Set Secure flag on cookies", "Add secure=True to cookie config"),
+                "3.4.2": ("Set HttpOnly flag on cookies", "Add httponly=True to cookie config"),
+                "3.4.3": ("Set SameSite=Strict on cookies", "Add samesite=Strict to cookie config"),
+                "5.3.4": ("Use parameterized queries", "Replace string SQL with SQLAlchemy text() and named params"),
+                "6.2.2": ("Use AES-256-GCM", "Replace weak cipher with AES-256-GCM"),
+                "6.3.1": ("Use secrets module", "Replace Math.random/rand with secrets.token_hex()"),
+                "9.2.3": ("Enable SSL verification", "Set verify=True in all requests calls"),
+                "14.3.2": ("Disable debug mode", "Set DEBUG=False in production config"),
+            }
+            if implemented and not wrong_impl:
                 valid_cell.value = "Valid"
                 valid_cell.fill  = pass_fill
                 valid_cell.font  = pass_font
                 valid_cell.alignment = ctr_align
-                src_cell.value = finding.get("note","Control detected in source code") if finding else "Control detected"
+                # Source Code Reference - real line number and code
+                line_num = finding.get("lineNumber") if finding else None
+                line_content = finding.get("lineContent") if finding else None
+                note = finding.get("note","Control detected") if finding else "Control detected"
+                conf = finding.get("confidence","").upper() if finding else ""
+                if line_num and line_content:
+                    src_cell.value = f"Line {line_num}: {line_content}"
+                    comment_cell.value = f"[{conf}] {note} detected at line {line_num}"
+                else:
+                    src_cell.value = note
+                    comment_cell.value = f"Confidence: {conf} — {note}" if conf else "Pattern match confirmed"
                 src_cell.alignment = lft_align
-                comment_cell.value = "Confidence: " + finding.get("confidence","").upper() if finding else "Detected"
+            elif wrong_impl:
+                # CASE 2: Wrong implementation
+                valid_cell.value = "Wrong Implementation"
+                valid_cell.fill  = PF("solid", fgColor="FFEB9C")
+                valid_cell.font  = FN(color="9C6500", bold=True, name="Calibri", size=10)
+                valid_cell.alignment = ctr_align
+                line_num = finding.get("lineNumber") if finding else None
+                line_content = finding.get("lineContent") if finding else None
+                wrong_note = finding.get("note","Wrong implementation") if finding else ""
+                guidance, fix = rmap.get(req_id, ("Review per ASVS 5.0","Fix required"))
+                if line_num and line_content:
+                    src_cell.value = f"Line {line_num}: {line_content}"
+                    comment_cell.value = f"WRONG at line {line_num} — {wrong_note}. Fix: {fix[:80]} | {cwe_ref}"
+                else:
+                    src_cell.value = guidance
+                    comment_cell.value = f"Wrong implementation — {wrong_note} | {cwe_ref}"
+                src_cell.alignment = lft_align
             else:
                 valid_cell.value = "Not Valid"
                 valid_cell.fill  = fail_fill
@@ -479,7 +543,8 @@ def export_excel():
                     "14.5.1":"Specify methods=[GET,POST] in all route decorators",
                     "14.5.3":"Set CORS origins=[https://yourdomain.com] — never wildcard",
                 }
-                comment_cell.value = unique_comments.get(req_id, "Review ASVS 5.0 spec for " + req_id + " implementation guidance")
+                cwe_text = f" | {cwe_ref}" if cwe_ref else ""
+                comment_cell.value = unique_comments.get(req_id, "Review ASVS 5.0 spec for " + req_id + " implementation guidance") + cwe_text
 
     # Update ASVS Results sheet
     if "ASVS Results" in wb.sheetnames:
@@ -490,9 +555,47 @@ def export_excel():
         bl1_f = PF2("solid",fgColor="FFC7CE"); bl1_ft = FN2(color="9C0006",bold=True,name="Calibri",size=10)
         na_f  = PF2("solid",fgColor="F2F2F2"); na_ft  = FN2(color="595959",italic=True,name="Calibri",size=10)
         ctr2  = AL2(horizontal="center",vertical="center")
+        # Use our mapped totals (103) not full ASVS sheet totals (283)
         t_found = sum(cd.get("implemented",0) for cd in results.values())
         t_reqs = sum(cd.get("total",0) for cd in results.values())
         t_pct = round((t_found/t_reqs)*100) if t_reqs else 0
+
+        # Override the Excel formula cells in Total row with our values
+        for row in ws_r.iter_rows(min_row=2):
+            cat_name = str(row[0].value).strip().lower() if row[0].value else ""
+            if cat_name == "total":
+                # Replace Excel SUM formulas with our mapped values
+                row[1].value = t_found   # Valid criteria
+                row[2].value = t_reqs    # Total criteria (103)
+                row[3].value = round(t_pct, 2)  # Percentage
+                break
+        from openpyxl.styles import Alignment as AL2
+        skip_cats = ['architecture', 'malicious', 'business']
+        rows_to_delete = []
+        for row in ws_r.iter_rows(min_row=2):
+            cat_name = str(row[0].value).strip() if row[0].value else ""
+            if not cat_name: continue
+            # Delete architecture malicious business rows
+            if any(s in cat_name.lower() for s in skip_cats):
+                rows_to_delete.append(row[0].row)
+                continue
+            # Fix VALUE errors - replace formulas with plain values
+            for cell in row:
+                if cell.value and str(cell.value).startswith('='):
+                    cell.value = None
+                # Apply wrap text to all cells
+                cell.alignment = AL2(wrap_text=True, vertical="top", horizontal="left")
+
+        for row_num in sorted(rows_to_delete, reverse=True):
+            ws_r.delete_rows(row_num)
+
+        # Fix column widths in ASVS Results
+        ws_r.column_dimensions["A"].width = 28
+        ws_r.column_dimensions["B"].width = 14
+        ws_r.column_dimensions["C"].width = 14
+        ws_r.column_dimensions["D"].width = 16
+        ws_r.column_dimensions["E"].width = 18
+
         for row in ws_r.iter_rows(min_row=2):
             cat_name = str(row[0].value).strip() if row[0].value else ""
             if not cat_name: continue
@@ -510,6 +613,10 @@ def export_excel():
                 cd = results[matched]
                 imp = cd.get("implemented",0); tot = cd.get("total",0)
                 pct = round((imp/tot)*100) if tot else 0
+                # Override Excel formula cells with our mapped values
+                row[1].value = imp   # Valid criteria (our mapped count)
+                row[2].value = tot   # Total criteria (our mapped total)
+                row[3].value = round(pct, 2)  # Our percentage
                 if pct>=70:
                     lvl_cell.value="Level 2"; lvl_cell.fill=lv2_f; lvl_cell.font=lv2_ft
                 elif pct>=40:
@@ -527,7 +634,7 @@ def export_excel():
     return send_file(buf,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         as_attachment=True,
-        download_name="ASVS-checklist-filled.xlsx")
+        download_name="ASVS-Compliance-Maturity-Report.xlsx")
 
 
 
@@ -550,7 +657,7 @@ def export_pdf():
         doc = SimpleDocTemplate(buf, pagesize=A4,
             topMargin=2*cm, bottomMargin=2*cm,
             leftMargin=2*cm, rightMargin=2*cm,
-            title="ASVS Report - " + project, author="ASVS Analyzer Pro")
+            title="ASVS Compliance & Maturity Analyzer - " + project, author="ASVS Compliance & Maturity Analyzer")
 
         NAVY   = colors.HexColor("#1F3864")
         BLUE   = colors.HexColor("#2E75B6")
@@ -585,14 +692,14 @@ def export_pdf():
         total_found = sum(cd.get("implemented",0) for cd in results.values())
         total_reqs  = sum(cd.get("total",0) for cd in results.values())
         overall     = round((total_found/total_reqs)*100) if total_reqs else 0
-        lvl         = "Level 2" if overall>=70 else "Level 1" if overall>=40 else "Below Level 1"
+        lvl         = "Level 3" if overall>=80 else "Level 2" if overall>=50 else "Level 1" if overall>=20 else "Below Level 1"
         lvl_color   = GREEN if overall>=70 else AMBER if overall>=40 else RED
         cats_active = len([c for c in results if results[c].get("implemented",0)>0])
-        ai_score = min(100, round(overall * 0.8 + (cats_active / 11) * 20))
+        ai_score = overall  # AI score matches overall coverage %
 
         # COVER BANNER
         banner = Table([
-            [Paragraph("ASVS Analyzer Pro", title_s)],
+            [Paragraph("ASVS Compliance & Maturity Analyzer", title_s)],
             [Paragraph("Application Security Verification Standard Report", sub_s)],
             [Paragraph("OWASP ASVS 5.0  ·  Automated Security Assessment  ·  " + now, sub_s)]
         ], colWidths=[17*cm])
@@ -609,7 +716,7 @@ def export_pdf():
         meta = Table([
             [Paragraph("Project", meta_k),         Paragraph(project, meta_v)],
             [Paragraph("Standard", meta_k),         Paragraph("OWASP Application Security Verification Standard 5.0", meta_v)],
-            [Paragraph("Tool", meta_k),             Paragraph("ASVS Analyzer Pro — AI-Powered Security Assessment", meta_v)],
+            [Paragraph("Tool", meta_k),             Paragraph("ASVS Compliance & Maturity Analyzer", meta_v)],
             [Paragraph("Overall Coverage", meta_k), Paragraph(str(overall)+"%", S("ov",fontSize=10,fontName="Helvetica-Bold",textColor=lvl_color))],
             [Paragraph("Maturity Level", meta_k),   Paragraph(lvl, S("lv",fontSize=10,fontName="Helvetica-Bold",textColor=lvl_color))],
         ], colWidths=[4.5*cm,12.5*cm])
@@ -643,14 +750,18 @@ def export_pdf():
         ], colWidths=[3.4*cm]*5)
         scores.setStyle(TableStyle([
             ("BACKGROUND",(0,0),(-1,-1),LLBLUE),
-            ("GRID",(0,0),(-1,-1),0.5,MGRAY),
             ("TOPPADDING",(0,0),(-1,-1),12),
             ("BOTTOMPADDING",(0,0),(-1,-1),8),
             ("ALIGN",(0,0),(-1,-1),"CENTER"),
             ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+            ("LINEABOVE",(0,0),(-1,0),0,WHITE),
+            ("LINEBELOW",(0,-1),(-1,-1),0,WHITE),
+            ("LINEBEFORE",(0,0),(0,-1),0,WHITE),
+            ("LINEAFTER",(-1,0),(-1,-1),0,WHITE),
+            ("INNERGRID",(0,0),(-1,-1),0,WHITE),
         ]))
         story.append(scores)
-        story.append(Spacer(1,0.3*cm))
+        story.append(Spacer(1,0.1*cm))
 
         top_cats  = [c for c,d in sorted(results.items(),key=lambda x:x[1].get("pct",0),reverse=True) if d.get("implemented",0)>0][:2]
         weak_cats = [c for c,d in sorted(results.items(),key=lambda x:x[1].get("pct",0)) if d.get("pct",0)<40][:2]
@@ -668,7 +779,6 @@ def export_pdf():
         story.append(Spacer(1,0.2*cm))
         story.append(Paragraph("AI Security Assessment", h1_s))
 
-        ai_score = min(100, round(overall*0.8 + (cats_active/11)*20))
 
         strengths, risks, recs = [], [], []
         for cat, cd in sorted(results.items(), key=lambda x:x[1].get("pct",0), reverse=True):
@@ -679,11 +789,11 @@ def export_pdf():
             if cd.get("pct",0)<40:
                 gap = next((r for r in cd.get("reqs",[]) if not r.get("implemented")),None)
                 if gap:
-                    risks.append(cat+" ("+str(cd.get("pct",0))+"% coverage): "+gap.get("requirement","")[:65]+"...")
-                    recs.append("["+gap.get("id","")+"] "+gap.get("requirement","")[:65]+"...")
+                    risks.append(cat+": "+gap.get("requirement",""))
+                    recs.append(gap.get("requirement",""))
 
         ai_top = Table([[
-            Paragraph("AI-Powered Security Analysis", S("ah",fontSize=12,fontName="Helvetica-Bold",textColor=BLUE)),
+            Paragraph("Security Analysis — ASVS Compliance & Maturity Analyzer", S("ah",fontSize=12,fontName="Helvetica-Bold",textColor=BLUE)),
             Paragraph("AI Score: "+str(ai_score)+"/100",
                 S("as",fontSize=11,fontName="Helvetica-Bold",
                   textColor=GREEN if ai_score>=70 else AMBER if ai_score>=40 else RED,
@@ -714,15 +824,17 @@ def export_pdf():
 
         def ai_col(title, items, col, bg):
             rows = [[Paragraph(title, S("ct",fontSize=10,fontName="Helvetica-Bold",textColor=col))]]
-            for item in (items[:4] if items else ["No items detected"]):
-                rows.append([Paragraph("› "+str(item)[:95], S("ci",fontSize=9,fontName="Helvetica",textColor=DGRAY,leading=13))])
-            t = Table(rows, colWidths=[5.4*cm])
+            for item in (items[:6] if items else ["No items detected"]):
+                rows.append([Paragraph("› "+str(item), S("ci",fontSize=8.5,fontName="Helvetica",textColor=DGRAY,leading=13,wordWrap="CJK"))])
+            t = Table(rows, colWidths=[5.3*cm])
             t.setStyle(TableStyle([
                 ("BACKGROUND",(0,0),(-1,-1),bg),
-                ("TOPPADDING",(0,0),(-1,-1),5),
-                ("BOTTOMPADDING",(0,0),(-1,-1),4),
+                ("TOPPADDING",(0,0),(-1,-1),6),
+                ("BOTTOMPADDING",(0,0),(-1,-1),5),
                 ("LEFTPADDING",(0,0),(-1,-1),8),
+                ("RIGHTPADDING",(0,0),(-1,-1),8),
                 ("LINEBELOW",(0,0),(0,0),1.5,col),
+                ("VALIGN",(0,0),(-1,-1),"TOP"),
             ]))
             return t
 
@@ -735,7 +847,14 @@ def export_pdf():
             ai_col("Security Risks",     risk_items, RED,   colors.HexColor("#FFF5F5")),
             ai_col("Recommendations",    rec_items,  AMBER, colors.HexColor("#FFFDF0")),
         ]], colWidths=[5.6*cm,5.6*cm,5.6*cm])
-        ai_cols.setStyle(TableStyle([("LEFTPADDING",(0,0),(-1,-1),2),("RIGHTPADDING",(0,0),(-1,-1),2),("TOPPADDING",(0,0),(-1,-1),4)]))
+        ai_cols.setStyle(TableStyle([
+            ("LEFTPADDING",(0,0),(-1,-1),4),
+            ("RIGHTPADDING",(0,0),(-1,-1),4),
+            ("TOPPADDING",(0,0),(-1,-1),6),
+            ("BOTTOMPADDING",(0,0),(-1,-1),6),
+            ("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("ALIGN",(0,0),(-1,-1),"LEFT"),
+        ]))
         story.append(ai_cols)
         story.append(Spacer(1,0.4*cm))
 
@@ -1054,13 +1173,21 @@ def export_pdf():
             for i,req in enumerate(reqs,1):
                 done=req.get("implemented",False)
                 f=req.get("finding",{}) or {}
-                note=(f.get("note","Detected")[:80] if done else remed.get(req.get("id",""),"Implement per ASVS 5.0")[:80])
+                line_num = f.get("lineNumber") if done and f else None
+                line_content = f.get("lineContent") if done and f else None
+                conf = f.get("confidence","").upper() if done and f else ""
+                if done and line_num and line_content:
+                    note = f"Line {line_num}: {line_content[:70]}"
+                elif done:
+                    note = f.get("note","Control detected")[:80]
+                else:
+                    note = remed.get(req.get("id",""),"Implement per ASVS 5.0 — see owasp.org")[:80]
                 nc=GREEN if done else GRAY
                 bg=LLBLUE if i%2==0 else WHITE
                 rrows.append([
                     Paragraph(req.get("id",""),   S("ri",fontSize=8,fontName="Helvetica-Bold",textColor=BLUE,alignment=TA_CENTER)),
                     Paragraph(req.get("level",""),S("rl",fontSize=8,fontName="Helvetica",alignment=TA_CENTER)),
-                    Paragraph(req.get("requirement","")[:150].replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"),S("rr",fontSize=8,fontName="Helvetica",leading=11)),
+                    Paragraph((req.get("requirement","")[:120] + f" [CWE-{req.get('cwe','')}]").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"),S("rr",fontSize=8,fontName="Helvetica",leading=11)),
                     Paragraph("<b>Pass</b>" if done else "<b>Fail</b>",
                         S("rs",fontSize=8,fontName="Helvetica-Bold",textColor=GREEN if done else RED,alignment=TA_CENTER)),
                     Paragraph(str(note).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"),S("rf",fontSize=7.5,fontName="Helvetica",textColor=nc,leading=10)),
@@ -1076,14 +1203,14 @@ def export_pdf():
         story.append(HRFlowable(width="100%",thickness=1.5,color=NAVY))
         story.append(Spacer(1,0.2*cm))
         story.append(Paragraph(
-            "Generated by ASVS Analyzer Pro  ·  OWASP ASVS 5.0  ·  "+now+"  ·  "
+            "Generated by ASVS Compliance & Maturity Analyzer  ·  OWASP ASVS 5.0  ·  "+now+"  ·  "
             "Coverage percentages are security maturity indicators and do not constitute formal ASVS compliance certification.",
             footer_s))
 
         doc.build(story)
         buf.seek(0)
         return send_file(buf, mimetype="application/pdf",
-            as_attachment=True, download_name="ASVS-Security-Report.pdf")
+            as_attachment=True, download_name="ASVS-Compliance-Maturity-Report.pdf")
     except Exception as e:
         import traceback
         print(traceback.format_exc())
@@ -1092,5 +1219,5 @@ def export_pdf():
 
 if __name__ == '__main__':
     init_db()
-    print("ASVS Pro backend running on port 3001...")
+    print("ASVS Compliance & Maturity Analyzer backend running on port 3001...")
     app.run(port=3001, debug=False)

@@ -130,6 +130,24 @@ const ASVS_DATA = {
   ],
 };
 
+const SOLIDITY_PATTERNS = [
+  { id:"4.1.3", regex:/onlyOwner|onlyAdmin|onlyRole|hasRole|AccessControl|Ownable/i, confidence:"high", note:"Access control modifier detected" },
+  { id:"4.2.1", regex:/require\(msg\.sender|require\(owner|modifier.*only/i, confidence:"high", note:"Ownership/IDOR check detected" },
+  { id:"5.1.3", regex:/require\(|revert\(|assert\(/i, confidence:"high", note:"Input validation via require/revert detected" },
+  { id:"6.2.2", regex:/keccak256|sha256|sha3|AES|encrypt/i, confidence:"high", note:"Cryptographic hash function detected" },
+  { id:"6.3.2", regex:/bytes32|bytes16|uint256.*random|block\.timestamp/i, confidence:"medium", note:"Unique identifier generation detected" },
+  { id:"5.3.4", regex:/mapping\(|SafeMath|unchecked\s*{/i, confidence:"medium", note:"Safe math or mapping used" },
+  { id:"7.4.1", regex:/emit\s+\w+Event|event\s+\w+|Error\(/i, confidence:"medium", note:"Event logging detected" },
+  { id:"7.4.2", regex:/try\s*{|catch\s*\(|revert\s*\(/i, confidence:"medium", note:"Error handling detected" },
+  { id:"4.3.1", regex:/Pausable|whenNotPaused|pause\(\)|unpause\(\)/i, confidence:"high", note:"Pausable/emergency stop detected" },
+  { id:"8.1.4", regex:/ReentrancyGuard|nonReentrant|mutex|locked/i, confidence:"high", note:"Reentrancy protection detected" },
+  { id:"14.2.1", regex:/import.*OpenZeppelin|@openzeppelin|SafeERC20/i, confidence:"high", note:"OpenZeppelin security library detected" },
+  { id:"9.1.1", regex:/https:\/\/|IPFS|ipfs\./i, confidence:"low", note:"Secure external reference detected" },
+  { id:"2.1.1", regex:/password.*length|minLength|maxLength/i, confidence:"medium", note:"Password length validation detected" },
+  { id:"6.4.1", regex:/private\s+\w+.*key|privateKey|secretKey/i, confidence:"medium", note:"Private key storage pattern detected" },
+  { id:"13.2.2", regex:/ABI\.decode|abi\.decode|JSON\.parse/i, confidence:"medium", note:"Input schema validation detected" },
+];
+
 const PATTERNS = {
   "Authentication": [
     { id:"2.4.1", regex:/bcrypt|argon2|scrypt|pbkdf2|password_hash|hashpw/i, confidence:"high", note:"Password hashing function detected" },
@@ -228,30 +246,149 @@ const CAT_META = {
 
 const CONF_COLOR = { high:"#4aff4a", medium:"#ffd44a", low:"#ff884a" };
 
+function getLineInfo(code, pattern) {
+  const lines = code.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (pattern.test(lines[i])) {
+      return {
+        lineNumber: i + 1,
+        lineContent: lines[i].trim().substring(0, 150),
+      };
+    }
+  }
+  return null;
+}
+
+const INSECURE_PATTERNS = {
+  "2.4.1": { pattern: /NoOpPasswordEncoder|MessageDigest.*MD5|new MD5|md5\(password/i, msg: "Insecure password storage — NoOpPasswordEncoder or MD5 detected" },
+  "2.4.4": { pattern: /gensalt\(\s*\)|rounds\s*=\s*[1-9](?!0)|saltRounds\s*=\s*[1-9](?!0)/i, msg: "bcrypt work factor too low — minimum 10 required" },
+  "3.4.1": { pattern: /secure\s*:\s*false|setSecure\(false\)|Secure=false/i, msg: "Secure flag disabled on cookie" },
+  "3.4.2": { pattern: /httpOnly\s*:\s*false|setHttpOnly\(false\)|HttpOnly=false/i, msg: "HttpOnly flag disabled on cookie" },
+  "3.5.3": { pattern: /algorithm.*none|alg.*none|HS256|HMAC.*SHA256/i, msg: "Weak JWT algorithm — use RS256 or ES256" },
+  "5.3.4": { pattern: /createStatement\(\)|Statement\(\)|executeQuery\(.*\+|query.*\+.*req|sql\s*\+=|sql\s*=.*\+/i, msg: "SQL injection risk — string concatenation in query detected" },
+  "6.2.2": { pattern: /DES|RC4|Cipher\.getInstance\(.*ECB|AES\/ECB/i, msg: "Weak cipher detected — use AES-256-GCM" },
+  "6.2.5": { pattern: /MD5|SHA-?1|DigestUtils\.md5|MessageDigest.*SHA.?1/i, msg: "Weak hash algorithm — never use MD5 or SHA1" },
+  "6.3.1": { pattern: /Math\.random\(\)|new Random\(\)|rand\(\)|mt_rand\(/i, msg: "Insecure random number generator — use SecureRandom or secrets" },
+  "9.2.3": { pattern: /verify\s*=\s*False|verify\s*=\s*false|VERIFY_SSL\s*=\s*false|InsecureRequestWarning/i, msg: "SSL certificate verification disabled" },
+  "9.1.3": { pattern: /TLSv1\.0|TLSv1\.1|SSLv3|SSLv2|TLS_1_0|TLS_1_1/i, msg: "Weak TLS version detected — minimum TLS 1.2 required" },
+  "2.10.4": { pattern: /api_key\s*=\s*["'][a-zA-Z0-9]{8,}|secret\s*=\s*["'][a-zA-Z0-9]{8,}|password\s*=\s*["'][a-zA-Z0-9]{6,}/i, msg: "Hardcoded secret or API key detected in source" },
+  "5.3.3": { pattern: /innerHTML\s*=|document\.write\(|\.html\(.*req/i, msg: "XSS risk — unsafe HTML output method detected" },
+  "5.2.4": { pattern: /eval\(.*req|eval\(.*input|exec\(.*request/i, msg: "Code injection risk — eval() with user input" },
+  "14.3.2": { pattern: /DEBUG\s*=\s*True|debug\s*=\s*true|app\.run.*debug.*True/i, msg: "Debug mode enabled — must be disabled in production" },
+  "4.2.2": { pattern: /csrf\s*=\s*false|csrf_exempt|csrfProtection\s*=\s*false/i, msg: "CSRF protection disabled" },
+  "5.3.8": { pattern: /Runtime\.exec\(|ProcessBuilder.*input|shell\s*=\s*True/i, msg: "Command injection risk — user input passed to shell" },
+  "8.2.2": { pattern: /localStorage\.setItem.*password|sessionStorage\.setItem.*token/i, msg: "Sensitive data stored in browser storage" },
+  "5.3.4": { pattern: /createStatement\(\)|Statement\(\)|executeQuery\(.*\+|query.*\+.*req|sql\s*\+=|sql\s*=.*\+/i, msg: "SQL injection risk — string concatenation in query detected" },
+};
+
+function getInsecureLineInfo(code, reqId) {
+  const insecure = INSECURE_PATTERNS[reqId];
+  if (!insecure) return null;
+  const lines = code.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (insecure.pattern.test(lines[i])) {
+      return {
+        lineNumber: i + 1,
+        lineContent: lines[i].trim().substring(0, 150),
+        msg: insecure.msg,
+        isWrong: true
+      };
+    }
+  }
+  return null;
+}
+
 function analyzeCode(code, category) {
   const findings = [];
   const matched = new Set();
   for (const p of (PATTERNS[category] || [])) {
     if (!matched.has(p.id) && p.regex.test(code)) {
       matched.add(p.id);
-      findings.push({ reqId: p.id, confidence: p.confidence, note: p.note });
+      const lineInfo = getLineInfo(code, p.regex);
+      findings.push({
+        reqId: p.id,
+        confidence: p.confidence,
+        note: p.note,
+        lineNumber: lineInfo ? lineInfo.lineNumber : null,
+        lineContent: lineInfo ? lineInfo.lineContent : null,
+        isWrong: false,
+      });
+    }
+  }
+  // Case 2: Wrong implementations
+  for (const p of (PATTERNS[category] || [])) {
+    if (!matched.has(p.id)) {
+      const wrongInfo = getInsecureLineInfo(code, p.id);
+      if (wrongInfo) {
+        findings.push({
+          reqId: p.id,
+          confidence: "low",
+          note: wrongInfo.msg,
+          lineNumber: wrongInfo.lineNumber,
+          lineContent: wrongInfo.lineContent,
+          isWrong: true,
+        });
+        matched.add(p.id);
+      }
     }
   }
   return findings;
 }
 
 function runAnalysis(files) {
+  const isSolidity = files.some(f => f.name && f.name.endsWith('.sol'));
   const combined = files.map(f => f.content).join("\n");
+  
+  // Handle Solidity files separately
+  if (isSolidity) {
+    const findings = [];
+    const matched = new Set();
+    for (const p of SOLIDITY_PATTERNS) {
+      if (!matched.has(p.id) && p.regex.test(combined)) {
+        matched.add(p.id);
+        const lineInfo = getLineInfo(combined, p.regex);
+        findings.push({
+          reqId: p.id,
+          confidence: p.confidence,
+          note: p.note,
+          lineNumber: lineInfo ? lineInfo.lineNumber : null,
+          lineContent: lineInfo ? lineInfo.lineContent : null,
+          isWrong: false,
+        });
+      }
+    }
+    // Build results for Solidity
+    const categoryResults = {};
+    let totalFindings = 0, totalReqs = 0;
+    for (const [cat, reqs] of Object.entries(ASVS_DATA)) {
+      const foundIds = new Set(findings.map(f => f.reqId));
+      const reqResults = reqs.map(req => {
+        const finding = findings.find(f => f.reqId === req.id) || null;
+        return { ...req, finding, implemented: foundIds.has(req.id), wrongImplementation: false };
+      });
+      const implemented = reqResults.filter(r => r.implemented).length;
+      const pct = Math.round((implemented / reqs.length) * 100);
+      categoryResults[cat] = { reqs: reqResults, implemented, total: reqs.length, pct };
+      totalFindings += implemented;
+      totalReqs += reqs.length;
+    }
+    return { categoryResults, totalFindings, totalReqs, overallPct: Math.round((totalFindings/totalReqs)*100), fileCount: files.length, language: 'Solidity' };
+  }
   const categoryResults = {};
   let totalFindings = 0, totalReqs = 0;
   for (const [cat, reqs] of Object.entries(ASVS_DATA)) {
     const findings = analyzeCode(combined, cat);
     const foundIds = new Set(findings.map(f => f.reqId));
-    const reqResults = reqs.map(req => ({
-      ...req,
-      finding: findings.find(f => f.reqId === req.id) || null,
-      implemented: foundIds.has(req.id)
-    }));
+    const reqResults = reqs.map(req => {
+      const finding = findings.find(f => f.reqId === req.id) || null;
+      const isWrongImpl = finding && finding.isWrong === true;
+      return {
+        ...req,
+        finding,
+        implemented: foundIds.has(req.id) && !isWrongImpl,
+        wrongImplementation: isWrongImpl,
+      };
+    });
     const implemented = reqResults.filter(r => r.implemented).length;
     categoryResults[cat] = { reqs: reqResults, implemented, total: reqs.length, pct: Math.round((implemented / reqs.length) * 100), findings };
     totalFindings += implemented;
@@ -269,13 +406,13 @@ function BarChart({ data }) {
     <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
       {data.map(d => (
         <div key={d.cat} style={{ display:"flex", alignItems:"center", gap:8 }}>
-          <div style={{ width:160, fontSize:11, color:"#7d8590", textAlign:"right", flexShrink:0 }}>
-            {CAT_META[d.cat]?.icon} {d.cat.split(" ").slice(0,2).join(" ")}
+          <div style={{ width:150, fontSize:11, color:"#555555", textAlign:"right", flexShrink:0, whiteSpace:"normal", lineHeight:1.3 }}>
+            {CAT_META[d.cat]?.icon} {d.cat}
           </div>
-          <div style={{ flex:1, height:18, background:"#21262d", borderRadius:4, overflow:"hidden" }}>
-            <div style={{ width:`${(d.pct/max)*100}%`, height:"100%", background: CAT_META[d.cat]?.color || "#58a6ff", borderRadius:4, transition:"width 0.6s ease", minWidth: d.pct>0?4:0 }}/>
+          <div style={{ flex:1, height:18, background:"#f0f2f5", borderRadius:4, overflow:"hidden" }}>
+            <div style={{ width:`${(d.pct/max)*100}%`, height:"100%", background: CAT_META[d.cat]?.color || "#1F3864", borderRadius:4, transition:"width 0.6s ease", minWidth: d.pct>0?4:0 }}/>
           </div>
-          <div style={{ width:36, fontSize:11, color:"#c9d1d9", fontWeight:700 }}>{d.pct}%</div>
+          <div style={{ width:36, fontSize:11, color:"#333333", fontWeight:700 }}>{d.pct}%</div>
         </div>
       ))}
     </div>
@@ -289,14 +426,14 @@ function RadialScore({ pct, level }) {
   return (
     <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:8 }}>
       <svg width={130} height={130} viewBox="0 0 130 130">
-        <circle cx={65} cy={65} r={r} fill="none" stroke="#21262d" strokeWidth={10}/>
+        <circle cx={65} cy={65} r={r} fill="none" stroke="#f0f2f5" strokeWidth={10}/>
         <circle cx={65} cy={65} r={r} fill="none" stroke={color} strokeWidth={10}
           strokeDasharray={`${dash} ${circ - dash}`} strokeLinecap="round"
           transform="rotate(-90 65 65)" style={{ transition:"stroke-dasharray 0.8s ease" }}/>
         <text x={65} y={60} textAnchor="middle" fill={color} fontSize={22} fontWeight={700}>{pct}%</text>
-        <text x={65} y={80} textAnchor="middle" fill="#7d8590" fontSize={11}>{level}</text>
+        <text x={65} y={80} textAnchor="middle" fill="#555555" fontSize={11}>{level}</text>
+        <text x={65} y={96} textAnchor="middle" fill="#555555" fontSize={10}>Overall Coverage</text>
       </svg>
-      <div style={{ fontSize:12, color:"#7d8590" }}>Overall Coverage</div>
     </div>
   );
 }
@@ -325,20 +462,20 @@ function AuthPage({ onLogin }) {
   };
 
   return (
-    <div style={{ minHeight:"100vh", background:"#0d1117", display:"flex", alignItems:"center", justifyContent:"center" }}>
-      <div style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:16, padding:40, width:360 }}>
+    <div style={{ minHeight:"100vh", background:"#f5f6fa", display:"flex", alignItems:"center", justifyContent:"center" }}>
+      <div style={{ background:"#ffffff", border:"1px solid #30363d", borderRadius:16, padding:40, width:360 }}>
         <div style={{ textAlign:"center", marginBottom:28 }}>
           <div style={{ fontSize:36, marginBottom:8 }}>🛡️</div>
-          <div style={{ fontSize:20, fontWeight:700, color:"#e6edf3" }}>ASVS Analyzer Pro</div>
-          <div style={{ fontSize:12, color:"#7d8590", marginTop:4 }}>OWASP Application Security Verification Standard</div>
+          <div style={{ fontSize:20, fontWeight:700, color:"#1a1a2e" }}>ASVS Compliance & Maturity Analyzer</div>
+          <div style={{ fontSize:12, color:"#555555", marginTop:4 }}>OWASP Application Security Verification Standard</div>
         </div>
         <div style={{ display:"flex", gap:8, marginBottom:24 }}>
           {["login","register"].map(m => (
             <button key={m} onClick={() => { setMode(m); setError(""); }} style={{
               flex:1, padding:"8px 0", borderRadius:8, border:"1px solid",
-              borderColor: mode===m ? "#388bfd" : "#30363d",
+              borderColor: mode===m ? "#2E75B6" : "#d0d7de",
               background: mode===m ? "#1f3a5c" : "transparent",
-              color: mode===m ? "#58a6ff" : "#7d8590",
+              color: mode===m ? "#1F3864" : "#555555",
               cursor:"pointer", fontWeight:600, fontSize:13, textTransform:"capitalize"
             }}>{m}</button>
           ))}
@@ -346,15 +483,15 @@ function AuthPage({ onLogin }) {
         <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
           <input value={username} onChange={e => setUsername(e.target.value)}
             placeholder="Username" onKeyDown={e => e.key==="Enter" && submit()}
-            style={{ padding:"10px 14px", borderRadius:8, border:"1px solid #30363d", background:"#0d1117", color:"#e6edf3", fontSize:14, outline:"none" }}/>
+            style={{ padding:"10px 14px", borderRadius:8, border:"1px solid #30363d", background:"#f5f6fa", color:"#1a1a2e", fontSize:14, outline:"none" }}/>
           <input type="password" value={password} onChange={e => setPassword(e.target.value)}
             placeholder="Password" onKeyDown={e => e.key==="Enter" && submit()}
-            style={{ padding:"10px 14px", borderRadius:8, border:"1px solid #30363d", background:"#0d1117", color:"#e6edf3", fontSize:14, outline:"none" }}/>
+            style={{ padding:"10px 14px", borderRadius:8, border:"1px solid #30363d", background:"#f5f6fa", color:"#1a1a2e", fontSize:14, outline:"none" }}/>
           {error && <div style={{ color:"#ff4a4a", fontSize:12, textAlign:"center" }}>{error}</div>}
           <button onClick={submit} disabled={loading} style={{
             padding:"11px", borderRadius:8, border:"none",
-            background: loading ? "#21262d" : "linear-gradient(135deg,#1f6feb,#388bfd)",
-            color: loading ? "#484f58" : "#fff", fontWeight:700, fontSize:14, cursor: loading?"not-allowed":"pointer"
+            background: loading ? "#f0f2f5" : "linear-gradient(135deg,#1f6feb,#388bfd)",
+            color: loading ? "#666666" : "#fff", fontWeight:700, fontSize:14, cursor: loading?"not-allowed":"pointer"
           }}>{loading ? "Please wait..." : mode==="login" ? "Sign In" : "Create Account"}</button>
         </div>
       </div>
@@ -379,6 +516,7 @@ export default function App() {
   const [dragOver, setDragOver] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
   const fileRef = useRef();
+  const folderRef = useRef();
 
   const login = (u) => { setUser(u); localStorage.setItem("asvs_user", JSON.stringify(u)); };
   const logout = () => { setUser(null); localStorage.removeItem("asvs_user"); setResults(null); setFiles([]); };
@@ -456,7 +594,7 @@ export default function App() {
       const cats = Object.entries(res.categoryResults);
       const topPassing = cats.filter(([,d]) => d.implemented > 0).sort((a,b) => b[1].implemented - a[1].implemented).slice(0,4);
       const topFailing = cats.filter(([,d]) => d.pct < 40).sort((a,b) => a[1].pct - b[1].pct).slice(0,4);
-      const score = Math.min(100, Math.round(res.overallPct * 0.8 + (Object.keys(res.categoryResults).filter(c => res.categoryResults[c].implemented > 0).length / 11) * 20));
+      const score = res.overallPct; // AI score matches overall coverage %
       const strengths = topPassing.map(([cat, d]) => {
         const ctrl = d.reqs.find(r => r.implemented);
         return ctrl ? cat + ": " + (ctrl.finding?.note || "Security control detected") : cat + ": " + d.implemented + " controls implemented";
@@ -467,7 +605,7 @@ export default function App() {
       });
       const recs = topFailing.slice(0,4).map(([cat, d]) => {
         const gap = d.reqs.find(r => !r.implemented);
-        return gap ? "[" + gap.id + "] " + gap.requirement.slice(0,70) + "..." : "Improve " + cat + " coverage";
+        return gap ? "[" + gap.id + "] " + gap.requirement : "Improve " + cat + " coverage";
       });
       const passing2 = topPassing.slice(0,2).map(([c]) => c).join(" and ");
       const failing2 = topFailing.slice(0,2).map(([c]) => c).join(" and ");
@@ -491,7 +629,7 @@ export default function App() {
       });
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
-      const a = document.createElement("a"); a.href=url; a.download="ASVS-Pro-Report.xlsx"; a.click();
+      const a = document.createElement("a"); a.href=url; a.download="ASVS-Compliance-Maturity-Report.xlsx"; a.click();
       URL.revokeObjectURL(url);
     } catch(e) { alert("Export failed: " + e.message); }
   };
@@ -505,7 +643,7 @@ export default function App() {
       });
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
-      const a = document.createElement("a"); a.href=url; a.download="ASVS-Pro-Report.pdf"; a.click();
+      const a = document.createElement("a"); a.href=url; a.download="ASVS-Compliance-Maturity-Report.pdf"; a.click();
       URL.revokeObjectURL(url);
     } catch(e) { alert("Export failed: " + e.message); }
   };
@@ -517,57 +655,57 @@ export default function App() {
     : [];
 
   const chartData = results
-    ? Object.entries(results.categoryResults).map(([cat, d]) => ({ cat, pct: d.pct }))
+    ? Object.entries(results.categoryResults).sort(([a],[b]) => { const order = ["Authentication","Session Management","Access Control","Input Validation","Cryptography at Rest","Error Handling and Logging","Communication Security","Data Protection","API and Web Service","Configuration","Files and Resources"]; return order.indexOf(a) - order.indexOf(b); }).map(([cat, d]) => ({ cat, pct: d.pct }))
     : [];
 
   return (
-    <div style={{ minHeight:"100vh", background:"#0d1117", color:"#e6edf3", fontFamily:"Segoe UI,system-ui,sans-serif" }}>
+    <div style={{ minHeight:"100vh", background:"#f5f6fa", color:"#1a1a2e", fontFamily:"Segoe UI,system-ui,sans-serif" }}>
       {/* Header */}
-      <div style={{ background:"#161b22", borderBottom:"1px solid #30363d", padding:"12px 24px", display:"flex", alignItems:"center", gap:12, position:"sticky", top:0, zIndex:100 }}>
+      <div style={{ background:"#ffffff", borderBottom:"1px solid #30363d", padding:"12px 24px", display:"flex", alignItems:"center", gap:12, position:"sticky", top:0, zIndex:100 }}>
         <div style={{ width:32, height:32, borderRadius:8, background:"linear-gradient(135deg,#1f6feb,#388bfd)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>🛡️</div>
         <div>
-          <div style={{ fontWeight:700, fontSize:15 }}>ASVS Analyzer Pro</div>
-          <div style={{ fontSize:10, color:"#7d8590" }}>OWASP ASVS 5.0 · AI-Powered</div>
+          <div style={{ fontWeight:700, fontSize:15 }}>ASVS Compliance & Maturity Analyzer</div>
+          <div style={{ fontSize:10, color:"#555555" }}>OWASP ASVS 5.0 · AI-Powered</div>
         </div>
         <div style={{ marginLeft:"auto", display:"flex", gap:6, alignItems:"center" }}>
           {["analyze","results","history","reference"].map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
               padding:"5px 12px", borderRadius:6, border:"1px solid",
-              borderColor: tab===t ? "#388bfd" : "#30363d",
-              background: tab===t ? "#1f3a5c" : "transparent",
-              color: tab===t ? "#58a6ff" : "#7d8590",
+              borderColor: tab===t ? "#1F3864" : "#d0d7de",
+              background: tab===t ? "#1F3864" : "transparent",
+              color: tab===t ? "#ffffff" : "#555555",
               cursor:"pointer", fontSize:11, fontWeight:600, textTransform:"capitalize"
             }}>{t}</button>
           ))}
           <div style={{ marginLeft:8, position:"relative" }}>
             <button onClick={() => setProfileOpen(p => !p)} style={{
               display:"flex", alignItems:"center", gap:8, padding:"5px 12px 5px 6px",
-              borderRadius:20, background:"#21262d", border:"1px solid #30363d",
+              borderRadius:20, background:"#f0f2f5", border:"1px solid #30363d",
               cursor:"pointer", transition:"border-color 0.2s"
             }}
-              onMouseEnter={e => e.currentTarget.style.borderColor="#388bfd"}
-              onMouseLeave={e => e.currentTarget.style.borderColor="#30363d"}>
-              <div style={{ width:26, height:26, borderRadius:"50%", background:"linear-gradient(135deg,#388bfd,#4affd4)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:11, fontWeight:700, color:"#0d1117" }}>{user.username[0].toUpperCase()}</div>
-              <span style={{ fontSize:12, color:"#c9d1d9", fontWeight:600 }}>{user.username}</span>
-              <span style={{ fontSize:10, color:"#7d8590" }}>{profileOpen?"▲":"▼"}</span>
+              onMouseEnter={e => e.currentTarget.style.borderColor="#2E75B6"}
+              onMouseLeave={e => e.currentTarget.style.borderColor="#d0d7de"}>
+              <div style={{ width:26, height:26, borderRadius:"50%", background:"linear-gradient(135deg,#388bfd,#4affd4)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:11, fontWeight:700, color:"#f5f6fa" }}>{user.username[0].toUpperCase()}</div>
+              <span style={{ fontSize:12, color:"#333333", fontWeight:600 }}>{user.username}</span>
+              <span style={{ fontSize:10, color:"#555555" }}>{profileOpen?"▲":"▼"}</span>
             </button>
             {profileOpen && (
-              <div style={{ position:"absolute", right:0, top:"calc(100% + 8px)", background:"#161b22", border:"1px solid #30363d", borderRadius:10, width:200, boxShadow:"0 8px 32px #00000088", zIndex:200, overflow:"hidden" }}>
-                <div style={{ padding:"12px 16px", borderBottom:"1px solid #30363d", display:"flex", alignItems:"center", gap:10 }}>
-                  <div style={{ width:36, height:36, borderRadius:"50%", background:"linear-gradient(135deg,#388bfd,#4affd4)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:14, fontWeight:700, color:"#0d1117" }}>{user.username[0].toUpperCase()}</div>
+              <div style={{ position:"absolute", right:0, top:"calc(100% + 8px)", background:"#ffffff", border:"1px solid #d0d7de", borderRadius:10, width:200, boxShadow:"0 4px 16px rgba(0,0,0,0.15)", zIndex:200, overflow:"hidden" }}>
+                <div style={{ padding:"12px 16px", borderBottom:"1px solid #d0d7de", background:"#f5f6fa", display:"flex", alignItems:"center", gap:10 }}>
+                  <div style={{ width:36, height:36, borderRadius:"50%", background:"linear-gradient(135deg,#388bfd,#4affd4)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:14, fontWeight:700, color:"#f5f6fa" }}>{user.username[0].toUpperCase()}</div>
                   <div>
-                    <div style={{ fontWeight:700, fontSize:13, color:"#e6edf3" }}>{user.username}</div>
-                    <div style={{ fontSize:11, color:"#7d8590" }}>ASVS Pro User</div>
+                    <div style={{ fontWeight:700, fontSize:13, color:"#1a1a2e" }}>{user.username}</div>
+                    <div style={{ fontSize:11, color:"#555555" }}>ASVS Compliance & Maturity Analyzer User</div>
                   </div>
                 </div>
                 <div style={{ padding:8 }}>
-                  <button onClick={() => { setTab("history"); setProfileOpen(false); fetchScans(); }} style={{ width:"100%", padding:"8px 12px", background:"transparent", border:"none", color:"#c9d1d9", cursor:"pointer", textAlign:"left", borderRadius:6, fontSize:13, display:"flex", alignItems:"center", gap:8 }}
-                    onMouseEnter={e => e.currentTarget.style.background="#21262d"}
+                  <button onClick={() => { setTab("history"); setProfileOpen(false); fetchScans(); }} style={{ width:"100%", padding:"8px 12px", background:"transparent", border:"none", color:"#333333", cursor:"pointer", textAlign:"left", borderRadius:6, fontSize:13, display:"flex", alignItems:"center", gap:8 }}
+                    onMouseEnter={e => e.currentTarget.style.background="#f0f2f5"}
                     onMouseLeave={e => e.currentTarget.style.background="transparent"}>
                     🕐 Scan History
                   </button>
-                  <button onClick={() => { setTab("reference"); setProfileOpen(false); }} style={{ width:"100%", padding:"8px 12px", background:"transparent", border:"none", color:"#c9d1d9", cursor:"pointer", textAlign:"left", borderRadius:6, fontSize:13, display:"flex", alignItems:"center", gap:8 }}
-                    onMouseEnter={e => e.currentTarget.style.background="#21262d"}
+                  <button onClick={() => { setTab("reference"); setProfileOpen(false); }} style={{ width:"100%", padding:"8px 12px", background:"transparent", border:"none", color:"#333333", cursor:"pointer", textAlign:"left", borderRadius:6, fontSize:13, display:"flex", alignItems:"center", gap:8 }}
+                    onMouseEnter={e => e.currentTarget.style.background="#f0f2f5"}
                     onMouseLeave={e => e.currentTarget.style.background="transparent"}>
                     📖 ASVS Reference
                   </button>
@@ -592,33 +730,39 @@ export default function App() {
             <div style={{ display:"flex", gap:12, alignItems:"center" }}>
               <input value={projectName} onChange={e => setProjectName(e.target.value)}
                 placeholder="Project name..."
-                style={{ padding:"8px 14px", borderRadius:8, border:"1px solid #30363d", background:"#161b22", color:"#e6edf3", fontSize:13, outline:"none", width:260 }}/>
-              <div style={{ fontSize:12, color:"#7d8590" }}>Name your project before scanning</div>
+                style={{ padding:"8px 14px", borderRadius:8, border:"1px solid #30363d", background:"#ffffff", color:"#1a1a2e", fontSize:13, outline:"none", width:260 }}/>
+              <div style={{ fontSize:12, color:"#555555" }}>Name your project before scanning</div>
             </div>
 
             {/* Drop zone */}
             <div onDrop={handleDrop} onDragOver={e => { e.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)}
               onClick={() => fileRef.current.click()}
-              style={{ border:`2px dashed ${dragOver ? "#388bfd" : "#30363d"}`, borderRadius:12, padding:40, textAlign:"center", cursor:"pointer", background: dragOver ? "#1f3a5c22" : "#161b22", transition:"all 0.2s" }}>
+              style={{ border:`2px dashed ${dragOver ? "#2E75B6" : "#d0d7de"}`, borderRadius:12, padding:40, textAlign:"center", cursor:"pointer", background: dragOver ? "#1f3a5c22" : "#ffffff", transition:"all 0.2s" }}>
               <div style={{ fontSize:36, marginBottom:10 }}>📂</div>
               <div style={{ fontWeight:600, marginBottom:4 }}>Drop files here or click to upload</div>
-              <div style={{ fontSize:12, color:"#7d8590" }}>JS, Python, Java, Go, PHP, Ruby, C#, TypeScript — multiple files supported</div>
-              <input ref={fileRef} type="file" multiple accept=".js,.py,.java,.go,.php,.rb,.ts,.cs,.cpp,.c,.rs,.kt,.swift" onChange={e => handleFiles(e.target.files)} style={{ display:"none" }}/>
+              <div style={{ fontSize:12, color:"#555555" }}>JS, Python, Java, Go, PHP, Ruby, C#, TypeScript, Solidity — multiple files supported</div>
+              <input ref={fileRef} type="file" multiple accept=".js,.py,.java,.go,.php,.rb,.ts,.cs,.cpp,.c,.rs,.kt,.swift,.sol,.xml,.json,.yaml,.yml" onChange={e => handleFiles(e.target.files)} style={{ display:"none" }}/>
+          <input ref={folderRef} type="file" webkitdirectory="" directory="" multiple onChange={e => handleFiles(e.target.files)} style={{ display:"none" }}/>
             </div>
 
             {/* File list */}
             {files.length > 0 && (
-              <div style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:10, overflow:"hidden" }}>
+              <div style={{ background:"#ffffff", border:"1px solid #30363d", borderRadius:10, overflow:"hidden" }}>
                 <div style={{ padding:"10px 16px", borderBottom:"1px solid #30363d", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
                   <span style={{ fontWeight:600, fontSize:13 }}>{files.length} file{files.length>1?"s":""} loaded</span>
-                  <button onClick={() => setFiles([])} style={{ background:"none", border:"none", color:"#ff4a4a", cursor:"pointer", fontSize:12 }}>Clear all</button>
+                  <button onClick={() => setFiles([])} style={{ background:"none", border:"none", color:"#ff4a4a", cursor:"pointer", fontSize:12 }}>Clear all</button> <button
+                onClick={() => folderRef.current.click()}
+                onClick={() => folderRef.current.click()}
+                style={{ marginLeft:'8px', padding:'10px 20px', borderRadius:8, border:'1px dashed #2E75B6', background:'transparent', color:'#1F3864', fontWeight:700, fontSize:13, cursor:'pointer' }}>
+                📁 Upload Folder
+              </button>
                 </div>
                 {files.map((f, i) => (
                   <div key={i} style={{ padding:"8px 16px", borderBottom:"1px solid #21262d", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-                    <span style={{ fontSize:12, color:"#c9d1d9" }}>📄 {f.name}</span>
+                    <span style={{ fontSize:12, color:"#333333" }}>📄 {f.name}</span>
                     <div style={{ display:"flex", gap:12, alignItems:"center" }}>
-                      <span style={{ fontSize:11, color:"#7d8590" }}>{Math.round(f.size/1024)} KB · {f.content.split("\n").length} lines</span>
-                      <button onClick={() => setFiles(prev => prev.filter((_,j)=>j!==i))} style={{ background:"none", border:"none", color:"#484f58", cursor:"pointer", fontSize:12 }}>✕</button>
+                      <span style={{ fontSize:11, color:"#555555" }}>{Math.round(f.size/1024)} KB · {f.content.split("\n").length} lines</span>
+                      <button onClick={() => setFiles(prev => prev.filter((_,j)=>j!==i))} style={{ background:"none", border:"none", color:"#666666", cursor:"pointer", fontSize:12 }}>✕</button>
                     </div>
                   </div>
                 ))}
@@ -627,8 +771,8 @@ export default function App() {
 
             <button onClick={analyze} disabled={!files.length || loading} style={{
               padding:"12px", borderRadius:10, border:"none", alignSelf:"flex-end", width:220,
-              background: files.length && !loading ? "linear-gradient(135deg,#1f6feb,#388bfd)" : "#21262d",
-              color: files.length && !loading ? "#fff" : "#484f58",
+              background: files.length && !loading ? "linear-gradient(135deg,#1f6feb,#388bfd)" : "#f0f2f5",
+              color: files.length && !loading ? "#fff" : "#666666",
               fontWeight:700, fontSize:14, cursor: files.length && !loading ? "pointer" : "not-allowed"
             }}>{loading ? "⟳ Scanning..." : "🔍 Run ASVS Analysis"}</button>
           </div>
@@ -640,14 +784,14 @@ export default function App() {
             {/* Top stats */}
             <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:12 }}>
               {[
-                { label:"Controls Found", value:results.totalFindings, color:"#58a6ff" },
-                { label:"Total Requirements", value:results.totalReqs, color:"#7d8590" },
+                { label:"Controls Found", value:results.totalFindings, color:"#1F3864" },
+                { label:"Total Requirements", value:results.totalReqs, color:"#555555" },
                 { label:"Coverage", value:`${results.overallPct}%`, color: results.overallPct>=70?"#4aff4a":results.overallPct>=40?"#ffd44a":"#ff4a4a" },
                 { label:"Files Analyzed", value:files.length, color:"#ffd44a" },
                 { label:"Categories", value:Object.keys(results.categoryResults).filter(c=>results.categoryResults[c].implemented>0).length, color:"#4ad4ff" },
               ].map(s => (
-                <div key={s.label} style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:10, padding:16 }}>
-                  <div style={{ fontSize:10, color:"#7d8590", textTransform:"uppercase", letterSpacing:"0.5px", marginBottom:6 }}>{s.label}</div>
+                <div key={s.label} style={{ background:"#ffffff", border:"1px solid #30363d", borderRadius:10, padding:16 }}>
+                  <div style={{ fontSize:10, color:"#555555", textTransform:"uppercase", letterSpacing:"0.5px", marginBottom:6 }}>{s.label}</div>
                   <div style={{ fontSize:24, fontWeight:700, color:s.color }}>{s.value}</div>
                 </div>
               ))}
@@ -655,11 +799,11 @@ export default function App() {
 
             {/* Chart + Radial */}
             <div style={{ display:"grid", gridTemplateColumns:"1fr auto", gap:16 }}>
-              <div style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:10, padding:20 }}>
+              <div style={{ background:"#ffffff", border:"1px solid #30363d", borderRadius:10, padding:20 }}>
                 <div style={{ fontWeight:700, marginBottom:14, fontSize:13 }}>Category Coverage</div>
                 <BarChart data={chartData} />
               </div>
-              <div style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:10, padding:20, display:"flex", alignItems:"center", justifyContent:"center" }}>
+              <div style={{ background:"#ffffff", border:"1px solid #30363d", borderRadius:10, padding:20, display:"flex", alignItems:"center", justifyContent:"center" }}>
                 <RadialScore pct={results.overallPct} level={results.level} />
               </div>
             </div>
@@ -672,39 +816,39 @@ export default function App() {
 
             {/* AI Insights */}
             {aiLoading && (
-              <div style={{ background:"#161b22", border:"1px solid #1f6feb", borderRadius:10, padding:20, textAlign:"center", color:"#7d8590" }}>
+              <div style={{ background:"#ffffff", border:"1px solid #1f6feb", borderRadius:10, padding:20, textAlign:"center", color:"#555555" }}>
                 🤖 Claude AI is analyzing your code...
               </div>
             )}
             {!aiLoading && !aiInsights && results && (
-              <div style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:10, padding:20 }}>
+              <div style={{ background:"#ffffff", border:"1px solid #30363d", borderRadius:10, padding:20 }}>
                 <div style={{ display:"flex", gap:8, alignItems:"center", marginBottom:10 }}>
                   <span style={{ fontSize:16 }}>🤖</span>
-                  <span style={{ fontWeight:700, color:"#58a6ff", fontSize:13 }}>Claude AI Security Assessment</span>
-                  <span style={{ marginLeft:"auto", fontSize:11, color:"#7d8590" }}>Add Anthropic credits to enable AI analysis</span>
+                  <span style={{ fontWeight:700, color:"#1F3864", fontSize:13 }}>Claude AI Security Assessment</span>
+                  
                 </div>
                 <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12 }}>
-                  <div style={{ background:"#0d1117", borderRadius:8, padding:12, border:"1px solid #4aff4a22" }}>
+                  <div style={{ background:"#f5f6fa", borderRadius:8, padding:12, border:"1px solid #4aff4a22" }}>
                     <div style={{ fontSize:11, fontWeight:700, color:"#4aff4a", marginBottom:8 }}>✅ Likely Strengths</div>
-                    <div style={{ fontSize:12, color:"#c9d1d9" }}>Based on pattern detection, {results.totalFindings} security controls were detected including authentication, session management, and configuration controls.</div>
+                    <div style={{ fontSize:12, color:"#333333" }}>Based on pattern detection, {results.totalFindings} security controls were detected including authentication, session management, and configuration controls.</div>
                   </div>
-                  <div style={{ background:"#0d1117", borderRadius:8, padding:12, border:"1px solid #ff884a22" }}>
+                  <div style={{ background:"#f5f6fa", borderRadius:8, padding:12, border:"1px solid #ff884a22" }}>
                     <div style={{ fontSize:11, fontWeight:700, color:"#ff884a", marginBottom:8 }}>⚠️ Key Gaps</div>
-                    <div style={{ fontSize:12, color:"#c9d1d9" }}>{results.totalReqs - results.totalFindings} ASVS requirements undetected. Check gap analysis in each category for specific remediation guidance.</div>
+                    <div style={{ fontSize:12, color:"#333333" }}>{results.totalReqs - results.totalFindings} ASVS requirements undetected. Check gap analysis in each category for specific remediation guidance.</div>
                   </div>
-                  <div style={{ background:"#0d1117", borderRadius:8, padding:12, border:"1px solid #ffd44a22" }}>
+                  <div style={{ background:"#f5f6fa", borderRadius:8, padding:12, border:"1px solid #ffd44a22" }}>
                     <div style={{ fontSize:11, fontWeight:700, color:"#ffd44a", marginBottom:8 }}>💡 Recommendation</div>
-                    <div style={{ fontSize:12, color:"#c9d1d9" }}>Focus on categories with 0% coverage first. Add Anthropic API credits at console.anthropic.com for full AI-powered analysis.</div>
+                    <div style={{ fontSize:12, color:"#333333" }}>Focus on categories with 0% coverage first.  API credits at console.anthropic.com for full AI-powered analysis.</div>
                   </div>
                 </div>
               </div>
             )}
             {aiInsights && (
-              <div style={{ background:"linear-gradient(135deg,#161b22,#1a1f2a)", border:"1px solid #1f6feb", borderRadius:10, padding:20 }}>
+              <div style={{ background:"linear-gradient(135deg,#EEF4FF,#D6E4F0)", border:"1px solid #2E75B6", borderRadius:10, padding:20 }}>
                 <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
                   <div style={{ display:"flex", gap:8, alignItems:"center" }}>
                     <span style={{ fontSize:16 }}>🤖</span>
-                    <span style={{ fontWeight:700, color:"#58a6ff", fontSize:13 }}>Claude AI Security Assessment</span>
+                    <span style={{ fontWeight:700, color:"#1F3864", fontSize:13 }}>Claude AI Security Assessment</span>
                   </div>
                   {aiInsights.securityScore !== undefined && (
                     <div style={{ padding:"4px 12px", borderRadius:20, background: aiInsights.securityScore>=70?"#4aff4a22":aiInsights.securityScore>=40?"#ffd44a22":"#ff4a4a22", color: aiInsights.securityScore>=70?"#4aff4a":aiInsights.securityScore>=40?"#ffd44a":"#ff4a4a", fontSize:12, fontWeight:700 }}>
@@ -712,17 +856,17 @@ export default function App() {
                     </div>
                   )}
                 </div>
-                <p style={{ margin:"0 0 14px", color:"#c9d1d9", fontSize:13, lineHeight:1.7 }}>{aiInsights.summary}</p>
+                <p style={{ margin:"0 0 14px", color:"#333333", fontSize:13, lineHeight:1.7 }}>{aiInsights.summary}</p>
                 <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12 }}>
                   {[
-                    { title:"✅ Strengths", items:aiInsights.strengths, color:"#4aff4a" },
-                    { title:"⚠️ Risks", items:aiInsights.risks, color:"#ff884a" },
-                    { title:"💡 Recommendations", items:aiInsights.topRecommendations, color:"#ffd44a" },
+                    { title:"✅ Strengths", items:aiInsights.strengths, color:"#375623" },
+                    { title:"⚠️ Risks", items:aiInsights.risks, color:"#9C0006" },
+                    { title:"💡 Recommendations", items:aiInsights.topRecommendations, color:"#9C6500" },
                   ].map(s => (
-                    <div key={s.title} style={{ background:"#0d1117", borderRadius:8, padding:12, border:`1px solid ${s.color}22` }}>
+                    <div key={s.title} style={{ background:"#f5f6fa", borderRadius:8, padding:12, border:`1px solid ${s.color}22` }}>
                       <div style={{ fontSize:11, fontWeight:700, color:s.color, marginBottom:8 }}>{s.title}</div>
                       {(s.items||[]).map((item,i) => (
-                        <div key={i} style={{ fontSize:12, color:"#c9d1d9", marginBottom:6, lineHeight:1.5, display:"flex", gap:6 }}>
+                        <div key={i} style={{ fontSize:12, color:"#333333", marginBottom:6, lineHeight:1.5, display:"flex", gap:6 }}>
                           <span style={{ color:s.color, flexShrink:0 }}>›</span>{item}
                         </div>
                       ))}
@@ -735,66 +879,72 @@ export default function App() {
             {/* Category sidebar + detail */}
             <div style={{ display:"grid", gridTemplateColumns:"220px 1fr", gap:16 }}>
               <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
-                {Object.entries(results.categoryResults).map(([cat, d]) => {
-                  const meta = CAT_META[cat] || { color:"#58a6ff", icon:"🔷" };
+                {Object.entries(results.categoryResults).sort(([a],[b]) => { const order = ["Authentication","Session Management","Access Control","Input Validation","Cryptography at Rest","Error Handling and Logging","Communication Security","Data Protection","API and Web Service","Configuration","Files and Resources"]; return order.indexOf(a) - order.indexOf(b); }).map(([cat, d]) => {
+                  const meta = CAT_META[cat] || { color:"#1F3864", icon:"🔷" };
                   const active = selectedCat===cat;
                   return (
                     <button key={cat} onClick={() => setSelectedCat(cat)} style={{
-                      background: active?"#161b22":"transparent",
-                      border:`1px solid ${active?meta.color+"60":"#30363d"}`,
+                      background: active?"#ffffff":"transparent",
+                      border:`1px solid ${active?meta.color+"60":"#d0d7de"}`,
                       borderLeft:`3px solid ${active?meta.color:"transparent"}`,
                       borderRadius:8, padding:"8px 10px", cursor:"pointer", textAlign:"left"
                     }}>
                       <div style={{ display:"flex", justifyContent:"space-between", marginBottom:4 }}>
-                        <span style={{ fontSize:11, fontWeight:600, color:active?meta.color:"#c9d1d9" }}>{meta.icon} {cat.split(" ").slice(0,2).join(" ")}</span>
+                        <span style={{ fontSize:11, fontWeight:600, color:active?meta.color:"#333333" }}>{meta.icon} {cat.split(" ").slice(0,2).join(" ")}</span>
                         <span style={{ fontSize:11, color:meta.color, fontWeight:700 }}>{d.pct}%</span>
                       </div>
-                      <div style={{ height:3, background:"#21262d", borderRadius:2 }}>
+                      <div style={{ height:3, background:"#f0f2f5", borderRadius:2 }}>
                         <div style={{ width:`${d.pct}%`, height:"100%", background:meta.color, borderRadius:2 }}/>
                       </div>
-                      <div style={{ fontSize:10, color:"#484f58", marginTop:3 }}>{d.implemented}/{d.total}</div>
+                      <div style={{ fontSize:10, color:"#666666", marginTop:3 }}>{d.implemented}/{d.total}</div>
                     </button>
                   );
                 })}
               </div>
 
               {selectedCat && (
-                <div style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:10, padding:16, maxHeight:580, overflowY:"auto" }}>
+                <div style={{ background:"#ffffff", border:"1px solid #30363d", borderRadius:10, padding:16, maxHeight:580, overflowY:"auto" }}>
                   <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
                     <div>
                       <div style={{ fontWeight:700, fontSize:14 }}>{CAT_META[selectedCat]?.icon} {selectedCat}</div>
-                      <div style={{ fontSize:12, color:"#7d8590" }}>{results.categoryResults[selectedCat].implemented}/{results.categoryResults[selectedCat].total} requirements detected</div>
+                      <div style={{ fontSize:12, color:"#555555" }}>{results.categoryResults[selectedCat].implemented}/{results.categoryResults[selectedCat].total} requirements detected</div>
                     </div>
                     <div style={{ display:"flex", gap:5 }}>
                       {["all","1","2","3"].map(l => (
                         <button key={l} onClick={() => setFilterLevel(l)} style={{
-                          padding:"3px 9px", borderRadius:5, border:`1px solid ${filterLevel===l?"#58a6ff":"#30363d"}`,
-                          background: filterLevel===l?"#21262d":"transparent",
-                          color: filterLevel===l?"#58a6ff":"#7d8590", cursor:"pointer", fontSize:11
+                          padding:"3px 9px", borderRadius:5, border:`1px solid ${filterLevel===l?"#1F3864":"#d0d7de"}`,
+                          background: filterLevel===l?"#f0f2f5":"transparent",
+                          color: filterLevel===l?"#1F3864":"#555555", cursor:"pointer", fontSize:11
                         }}>{l==="all"?"All":`L${l}`}</button>
                       ))}
                     </div>
                   </div>
                   {filteredReqs.map(req => {
                     const isOpen = expanded[req.id];
-                    const meta = CAT_META[selectedCat] || { color:"#58a6ff" };
+                    const meta = CAT_META[selectedCat] || { color:"#1F3864" };
                     return (
-                      <div key={req.id} style={{ marginBottom:6, borderRadius:8, overflow:"hidden", border:`1px solid ${req.implemented?meta.color+"40":"#21262d"}`, background:req.implemented?meta.color+"08":"#0d1117" }}>
+                      <div key={req.id} style={{ marginBottom:6, borderRadius:8, overflow:"hidden", border:`1px solid ${req.implemented?meta.color+"40":"#f0f2f5"}`, background:req.implemented?meta.color+"08":"#f5f6fa" }}>
                         <button onClick={() => setExpanded(p => ({ ...p, [req.id]:!p[req.id] }))}
                           style={{ width:"100%", padding:"9px 12px", background:"transparent", border:"none", cursor:"pointer", display:"flex", alignItems:"center", gap:8, textAlign:"left" }}>
                           <span style={{ fontSize:13 }}>{req.implemented?"✅":"⬜"}</span>
                           <span style={{ fontSize:11, fontWeight:700, color:meta.color, background:meta.color+"20", padding:"2px 5px", borderRadius:4, flexShrink:0 }}>{req.id}</span>
-                          <span style={{ fontSize:10, color:"#484f58", background:"#21262d", padding:"2px 4px", borderRadius:4, flexShrink:0 }}>L{req.level}</span>
-                          {req.cwe && <span style={{ fontSize:10, color:"#484f58", flexShrink:0 }}>CWE-{req.cwe}</span>}
-                          <span style={{ fontSize:12, color:req.implemented?"#c9d1d9":"#484f58", flex:1 }}>{req.requirement.slice(0,85)}...</span>
+                          <span style={{ fontSize:10, color:"#666666", background:"#f0f2f5", padding:"2px 4px", borderRadius:4, flexShrink:0 }}>L{req.level}</span>
+                          {req.cwe && <span style={{ fontSize:10, color:"#666666", flexShrink:0 }}>CWE-{req.cwe}</span>}
+                          <span style={{ fontSize:12, color:req.implemented?"#333333":"#666666", flex:1 }}>{req.requirement.slice(0,85)}...</span>
                           {req.finding && <span style={{ fontSize:10, padding:"2px 5px", borderRadius:4, background:CONF_COLOR[req.finding.confidence]+"20", color:CONF_COLOR[req.finding.confidence], flexShrink:0 }}>{req.finding.confidence}</span>}
-                          <span style={{ color:"#484f58", fontSize:11 }}>{isOpen?"▲":"▼"}</span>
+                          <span style={{ color:"#666666", fontSize:11 }}>{isOpen?"▲":"▼"}</span>
                         </button>
                         {isOpen && (
                           <div style={{ padding:"0 12px 10px", borderTop:"1px solid #21262d" }}>
-                            <p style={{ fontSize:12, color:"#c9d1d9", lineHeight:1.7, margin:"8px 0" }}>{req.requirement}</p>
-                            {req.finding && <div style={{ background:"#0d1117", borderRadius:6, padding:"7px 10px", fontSize:12, color:"#7d8590" }}><span style={{ color:CONF_COLOR[req.finding.confidence], fontWeight:700 }}>{req.finding.confidence.toUpperCase()}:</span> {req.finding.note}</div>}
-                            {!req.implemented && <div style={{ background:"#1a1410", borderRadius:6, padding:"7px 10px", fontSize:12, color:"#7d8590", marginTop:5 }}>⚠️ Not detected. Manual review or implementation may be needed.</div>}
+                            <p style={{ fontSize:12, color:"#333333", lineHeight:1.7, margin:"8px 0" }}>{req.requirement}</p>
+                            {req.finding && <div style={{ background:"#f5f6fa", borderRadius:6, padding:"7px 10px", fontSize:12, color:"#555555" }}><span style={{ color:CONF_COLOR[req.finding.confidence], fontWeight:700 }}>{req.finding.confidence.toUpperCase()}:</span> {req.finding.note}</div>}
+                            {!req.implemented && (
+                              <div style={{ background:"#FFF2CC", borderRadius:6, padding:"7px 10px", fontSize:12, color:"#9C6500", marginTop:5, border:"1px solid #FFEB9C" }}>
+                                <strong>⚠️ Not Detected</strong><br/>
+                                <span style={{color:"#333333"}}>Requirement: {req.requirement}</span><br/>
+                                <span style={{color:"#C00000", fontSize:11}}>CWE-{req.cwe} — Control missing from source code</span>
+                              </div>
+                            )}
                           </div>
                         )}
                       </div>
@@ -807,7 +957,7 @@ export default function App() {
         )}
 
         {tab==="results" && !results && (
-          <div style={{ textAlign:"center", padding:"80px 0", color:"#484f58" }}>
+          <div style={{ textAlign:"center", padding:"80px 0", color:"#666666" }}>
             <div style={{ fontSize:48, marginBottom:16 }}>🔍</div>
             <div style={{ fontSize:16, marginBottom:6 }}>No analysis yet</div>
             <div style={{ fontSize:13 }}>Upload files and run analysis from the Analyze tab</div>
@@ -818,19 +968,19 @@ export default function App() {
         {tab==="history" && (
           <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
             <div style={{ fontWeight:700, fontSize:16, marginBottom:4 }}>Scan History</div>
-            {scans.length === 0 && <div style={{ color:"#484f58", fontSize:13, textAlign:"center", padding:40 }}>No scans yet. Run your first analysis!</div>}
+            {scans.length === 0 && <div style={{ color:"#666666", fontSize:13, textAlign:"center", padding:40 }}>No scans yet. Run your first analysis!</div>}
             {scans.map(s => (
-              <div key={s.id} onClick={() => loadHistoryScan(s.id)} style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:10, padding:16, display:"flex", justifyContent:"space-between", alignItems:"center", cursor:"pointer", transition:"border-color 0.2s" }}
-                onMouseEnter={e => e.currentTarget.style.borderColor="#388bfd"}
-                onMouseLeave={e => e.currentTarget.style.borderColor="#30363d"}>
+              <div key={s.id} onClick={() => loadHistoryScan(s.id)} style={{ background:"#ffffff", border:"1px solid #30363d", borderRadius:10, padding:16, display:"flex", justifyContent:"space-between", alignItems:"center", cursor:"pointer", transition:"border-color 0.2s" }}
+                onMouseEnter={e => e.currentTarget.style.borderColor="#2E75B6"}
+                onMouseLeave={e => e.currentTarget.style.borderColor="#d0d7de"}>
                 <div>
                   <div style={{ fontWeight:600, marginBottom:4 }}>📁 {s.project_name}</div>
-                  <div style={{ fontSize:12, color:"#7d8590" }}>{s.files_count} file{s.files_count>1?"s":""} · {s.total_findings}/{s.total_reqs} controls · {s.created_at}</div>
+                  <div style={{ fontSize:12, color:"#555555" }}>{s.files_count} file{s.files_count>1?"s":""} · {s.total_findings}/{s.total_reqs} controls · {s.created_at}</div>
                 </div>
                 <div style={{ display:"flex", gap:10, alignItems:"center" }}>
                   <div style={{ fontSize:20, fontWeight:700, color: s.overall_pct>=70?"#4aff4a":s.overall_pct>=40?"#ffd44a":"#ff4a4a" }}>{s.overall_pct}%</div>
-                  <div style={{ fontSize:11, padding:"3px 8px", borderRadius:6, background:"#21262d", color:"#c9d1d9" }}>{s.asvs_level}</div>
-                  <div style={{ fontSize:11, color:"#58a6ff" }}>View →</div>
+                  <div style={{ fontSize:11, padding:"3px 8px", borderRadius:6, background:"#f0f2f5", color:"#333333" }}>{s.asvs_level}</div>
+                  <div style={{ fontSize:11, color:"#1F3864" }}>View →</div>
                 </div>
               </div>
             ))}
@@ -842,16 +992,16 @@ export default function App() {
           <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
             <div style={{ fontWeight:700, fontSize:16, marginBottom:4 }}>ASVS 5.0 Reference — All Requirements</div>
             {Object.entries(ASVS_DATA).map(([cat, reqs]) => {
-              const meta = CAT_META[cat] || { color:"#58a6ff", icon:"🔷" };
+              const meta = CAT_META[cat] || { color:"#1F3864", icon:"🔷" };
               const open = expanded["ref_"+cat];
               return (
-                <div key={cat} style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:10, overflow:"hidden" }}>
+                <div key={cat} style={{ background:"#ffffff", border:"1px solid #30363d", borderRadius:10, overflow:"hidden" }}>
                   <button onClick={() => setExpanded(p => ({ ...p, ["ref_"+cat]:!p["ref_"+cat] }))}
                     style={{ width:"100%", padding:"13px 16px", background:"transparent", border:"none", cursor:"pointer", display:"flex", alignItems:"center", gap:10, textAlign:"left" }}>
                     <span style={{ fontSize:18 }}>{meta.icon}</span>
                     <div style={{ flex:1 }}>
-                      <div style={{ fontWeight:700, color:"#e6edf3", fontSize:13 }}>{cat}</div>
-                      <div style={{ fontSize:11, color:"#7d8590" }}>{reqs.length} requirements</div>
+                      <div style={{ fontWeight:700, color:"#1a1a2e", fontSize:13 }}>{cat}</div>
+                      <div style={{ fontSize:11, color:"#555555" }}>{reqs.length} requirements</div>
                     </div>
                     <span style={{ color:meta.color, fontSize:16 }}>{open?"▲":"▼"}</span>
                   </button>
@@ -862,7 +1012,7 @@ export default function App() {
                           <span style={{ fontSize:11, fontWeight:700, color:meta.color, background:meta.color+"20", padding:"2px 5px", borderRadius:4, flexShrink:0 }}>{req.id}</span>
                           <span style={{ fontSize:10, color:"#ffd44a", background:"#ffd44a20", padding:"2px 4px", borderRadius:4, flexShrink:0 }}>L{req.level}</span>
                           {req.cwe && <span style={{ fontSize:10, color:"#ff884a", background:"#ff884a20", padding:"2px 4px", borderRadius:4, flexShrink:0 }}>CWE-{req.cwe}</span>}
-                          <span style={{ fontSize:12, color:"#c9d1d9", lineHeight:1.6 }}>{req.requirement}</span>
+                          <span style={{ fontSize:12, color:"#333333", lineHeight:1.6 }}>{req.requirement}</span>
                         </div>
                       ))}
                     </div>
