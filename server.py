@@ -4,9 +4,169 @@ import json, os, hashlib, sqlite3, io, datetime
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from dotenv import load_dotenv
+import anthropic
+
+load_dotenv()
 
 app = Flask(__name__)
+
+# ASVS Level-weighted severity scoring. Since ASVS 5.0.0 discontinued CWE mappings,
+# we use ASVS Level as the severity signal instead: Level 1 = baseline hygiene every
+# app should have (weight 3), Level 2 = most business apps (weight 2), Level 3 =
+# high-assurance/advanced controls (weight 1). Missing a Level 1 control counts more
+# against the score than missing a Level 3 one.
+#
+# Maturity level classification follows how ASVS actually works: levels are cumulative,
+# not a single blended percentage. "Level 2" requires near-complete Level 1 coverage
+# PLUS solid combined L1+L2 coverage — you cannot claim Level 2 while missing basic
+# Level 1 controls.
+LEVEL_WEIGHTS = {"1": 3, "2": 2, "3": 1}
+
+def compute_weighted_score(reqs):
+    if not reqs:
+        return 0, "Not Assessed"
+    total_weight = earned_weight = 0
+    l1_total = l1_done = l12_total = l12_done = 0
+    for r in reqs:
+        lvl = str(r.get("level", "1"))
+        w = LEVEL_WEIGHTS.get(lvl, 1)
+        done = bool(r.get("implemented"))
+        total_weight += w
+        if done: earned_weight += w
+        if lvl == "1":
+            l1_total += 1
+            if done: l1_done += 1
+        if lvl in ("1", "2"):
+            l12_total += 1
+            if done: l12_done += 1
+    pct = round((earned_weight/total_weight)*100) if total_weight else 0
+    l1_pct = (l1_done/l1_total*100) if l1_total else 100
+    l12_pct = (l12_done/l12_total*100) if l12_total else 100
+    if l1_pct >= 90 and l12_pct >= 70:
+        level = "Level 2"
+    elif l1_pct >= 70:
+        level = "Level 1"
+    else:
+        level = "Below Level 1"
+    return pct, level
 CORS(app)
+
+ANTHROPIC_MODEL = "claude-opus-5"
+USE_CLAUDE_AI = os.getenv("USE_CLAUDE_AI", "false").lower() == "true"
+AI_MAX_CODE_CHARS = 120000  # keep the prompt well within the context window
+
+_anthropic_client = None
+def get_anthropic_client():
+    global _anthropic_client
+    if _anthropic_client is None:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            return None
+        _anthropic_client = anthropic.Anthropic(api_key=api_key)
+    return _anthropic_client
+
+# ══════════════════════════════════════════════════════════════════════════
+#  CLAUDE AI SECURITY ASSESSMENT — OUTPUT CONTRACT
+#  Model: claude-opus-5   |   effort: "low"  (fast, ~10s, keeps replies short)
+#  Enforced on the API call via output_config.format (JSON schema) — Claude
+#  cannot return anything outside this shape:
+#
+#    securityScore        int, 0-100          Claude's own judgment
+#    summary              string              1-2 short, plain-language sentences
+#    strengths            array, max 3 items  one plain sentence each
+#    risks                array, max 3 items  one plain sentence each
+#    topRecommendations   array, max 3 items  one actionable step each
+# ══════════════════════════════════════════════════════════════════════════
+AI_INSIGHTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "securityScore": {"type": "integer", "description": "Overall security posture, 0-100, based on your own review of the code"},
+        "summary": {"type": "string", "description": "One or two short, plain-language sentences on the codebase's overall security posture. No jargon, no code citations."},
+        "strengths": {"type": "array", "items": {"type": "string"}, "description": "At most 3 items. Each is one short, plain sentence naming a real security control found in the code."},
+        "risks": {"type": "array", "items": {"type": "string"}, "description": "At most 3 items. Each is one short, plain sentence naming a concrete risk or missing control, in everyday language."},
+        "topRecommendations": {"type": "array", "items": {"type": "string"}, "description": "At most 3 items. Each is one short, actionable next step a developer can take."}
+    },
+    "required": ["securityScore", "summary", "strengths", "risks", "topRecommendations"],
+    "additionalProperties": False
+}
+
+@app.route('/api/ai/analyze', methods=['POST'])
+def ai_analyze():
+    if not USE_CLAUDE_AI:
+        return jsonify({
+            "ok": True,
+            "securityScore": 0,
+            "summary": "AI analysis is disabled during development (USE_CLAUDE_AI=false). Enable it before final testing/demo.",
+            "strengths": [],
+            "risks": [],
+            "topRecommendations": [],
+            "aiDisabled": True
+        })
+
+    client = get_anthropic_client()
+    if client is None:
+        return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY is not configured on the server. Add it to a .env file next to server.py."}), 503
+
+    data = request.json or {}
+    code = data.get('code', '') or ''
+    project_name = data.get('project_name') or 'Project'
+    language = data.get('language') or 'source'
+    category_results = data.get('category_results') or {}
+
+    if not code.strip():
+        return jsonify({"ok": False, "error": "No source code provided"}), 400
+
+    truncated = len(code) > AI_MAX_CODE_CHARS
+    if truncated:
+        code = code[:AI_MAX_CODE_CHARS]
+
+    coverage_summary = "\n".join(
+        f"- {cat}: {d.get('implemented', 0)}/{d.get('total', 0)} controls detected by pattern-matching ({d.get('pct', 0)}%)"
+        for cat, d in category_results.items()
+    ) or "(no pattern-matching results available)"
+
+    user_content = (
+        f"Project: {project_name}\n"
+        f"Language: {language}\n\n"
+        f"A separate static pattern-matching pass already scored ASVS 5.0 category coverage:\n{coverage_summary}\n\n"
+        "Review the source code below and give your own independent, real assessment — base it on what you "
+        "actually see in the code, not just the coverage percentages above.\n\n"
+        + (f"[Note: source was truncated to {AI_MAX_CODE_CHARS} characters for this review]\n\n" if truncated else "")
+        + f"```{language}\n{code}\n```"
+    )
+
+    try:
+        response = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=4000,
+            output_config={"effort": "low", "format": {"type": "json_schema", "schema": AI_INSIGHTS_SCHEMA}},
+            system=(
+                "You are a security reviewer explaining findings to a non-expert reader. Write for someone "
+                "with no security background: short sentences, everyday words, no jargon, no CWE numbers, "
+                "no code snippets or function-name citations. Be direct and skimmable, not exhaustive."
+            ),
+            messages=[{"role": "user", "content": user_content}],
+        )
+    except anthropic.APIStatusError as e:
+        return jsonify({"ok": False, "error": f"Claude API error: {e.message}"}), 502
+    except anthropic.APIConnectionError:
+        return jsonify({"ok": False, "error": "Could not reach the Claude API"}), 502
+
+    if response.stop_reason == "refusal":
+        return jsonify({"ok": False, "error": "The assessment request was declined by the model"}), 502
+
+    text = next((b.text for b in response.content if b.type == "text"), None)
+    if not text:
+        return jsonify({"ok": False, "error": "Model returned no analysis"}), 502
+
+    try:
+        insights = json.loads(text)
+    except json.JSONDecodeError:
+        return jsonify({"ok": False, "error": "Model returned a malformed response"}), 502
+
+    insights["ok"] = True
+    return jsonify(insights)
 
 DB = os.path.expanduser("~/asvs-compliance-maturity-analyzer/asvs.db")
 
@@ -111,7 +271,7 @@ def export_excel():
     data = request.json
     results = data.get('categoryResults', {})
 
-    TEMPLATE = '/home/kali/asvs-compliance-maturity-analyzer/ASVS-checklist-en.xlsx'
+    TEMPLATE = '/home/kali/asvs-compliance-maturity-analyzer/ASVS-checklist-5.0.0.xlsx'
     if not os.path.exists(TEMPLATE):
         return jsonify({"error": "Template not found"}), 500
 
@@ -330,23 +490,26 @@ def export_excel():
     }
 
     sheet_map = {
-        "Authentication":"Authentication",
-        "Session Management":"Session Management",
-        "Access Control":"Access Control",
-        "Input Validation":"Input Validation",
-        "Cryptography at Rest":"Cryptography at Rest",
-        "Error Handling and Logging":"Error Handling and Logging",
-        "Data Protection":"Data Protection",
-        "Communication Security":"Communication Security",
-        "API and Web Service":"API and Web Service",
-        "Configuration":"Configuration",
-        "Files and Resources":"Files and Resources",
+        "Encoding and Sanitization": "Encoding and Sanitization",
+        "Validation and Business Logic": "Validation and Business Logic",
+        "Web Frontend Security": "Web Frontend Security",
+        "API and Web Service": "API and Web Service",
+        "File Handling": "File Handling",
+        "Authentication": "Authentication",
+        "Session Management": "Session Management",
+        "Authorization": "Authorization",
+        "Self-contained Tokens": "Self-contained Tokens",
+        "OAuth and OIDC": "OAuth and OIDC",
+        "Cryptography": "Cryptography",
+        "Secure Communication": "Secure Communication",
+        "Configuration": "Configuration",
+        "Data Protection": "Data Protection",
+        "Secure Coding and Architecture": "Secure Coding and Architecture",
+        "Security Logging and Error Handling": "Security Logging & Errors",
+        "WebRTC": "WebRTC",
     }
 
     # Remove unwanted sheets
-    for remove_sheet in ["Architecture", "Malicious Code", "Business Logic"]:
-        if remove_sheet in wb.sheetnames:
-            del wb[remove_sheet]
 
     for cat, cat_data in results.items():
         sheet_name = sheet_map.get(cat)
@@ -388,8 +551,7 @@ def export_excel():
             valid_cell   = row[6]
             src_cell     = row[7]
             comment_cell = row[8]
-            cwe = str(req.get("cwe","")) if req and req.get("cwe") else ""
-            cwe_ref = f"CWE-{cwe} — https://cwe.mitre.org/data/definitions/{cwe}.html" if cwe else ""
+            level_ref = f"ASVS Level {req.get('level','')}" if req and req.get("level") else ""
 
             wrong_impl = req.get("wrongImplementation", False) if req else False
             # rmap for wrong implementation guidance
@@ -434,17 +596,17 @@ def export_excel():
                 guidance, fix = rmap.get(req_id, ("Review per ASVS 5.0","Fix required"))
                 if line_num and line_content:
                     src_cell.value = f"Line {line_num}: {line_content}"
-                    comment_cell.value = f"WRONG at line {line_num} — {wrong_note}. Fix: {fix[:80]} | {cwe_ref}"
+                    comment_cell.value = f"WRONG at line {line_num} — {wrong_note}. Fix: {fix[:80]} | {level_ref}"
                 else:
                     src_cell.value = guidance
-                    comment_cell.value = f"Wrong implementation — {wrong_note} | {cwe_ref}"
+                    comment_cell.value = f"Wrong implementation — {wrong_note} | {level_ref}"
                 src_cell.alignment = lft_align
             else:
                 valid_cell.value = "Not Valid"
                 valid_cell.fill  = fail_fill
                 valid_cell.font  = fail_font
                 valid_cell.alignment = ctr_align
-                src_cell.value = remediation_map.get(req_id, "Implement control " + req_id + " per OWASP ASVS 5.0")
+                src_cell.value = remediation_map.get(req_id, "Implement: " + (req.get("requirement", "Review ASVS 5.0.0 spec for this requirement") if req else "Review ASVS 5.0.0 spec for this requirement"))
                 src_cell.alignment = lft_align
                 unique_comments = {
                     "2.1.1":"Add min length validation to registration handler",
@@ -543,7 +705,7 @@ def export_excel():
                     "14.5.1":"Specify methods=[GET,POST] in all route decorators",
                     "14.5.3":"Set CORS origins=[https://yourdomain.com] — never wildcard",
                 }
-                cwe_text = f" | {cwe_ref}" if cwe_ref else ""
+                cwe_text = f" | {level_ref}" if level_ref else ""
                 comment_cell.value = unique_comments.get(req_id, "Review ASVS 5.0 spec for " + req_id + " implementation guidance") + cwe_text
 
     # Update ASVS Results sheet
@@ -558,7 +720,8 @@ def export_excel():
         # Use our mapped totals (103) not full ASVS sheet totals (283)
         t_found = sum(cd.get("implemented",0) for cd in results.values())
         t_reqs = sum(cd.get("total",0) for cd in results.values())
-        t_pct = round((t_found/t_reqs)*100) if t_reqs else 0
+        t_all_reqs = [r for cd in results.values() for r in cd.get("reqs", [])]
+        t_pct, t_level = compute_weighted_score(t_all_reqs)
 
         # Override the Excel formula cells in Total row with our values
         for row in ws_r.iter_rows(min_row=2):
@@ -600,8 +763,8 @@ def export_excel():
             cat_name = str(row[0].value).strip() if row[0].value else ""
             if not cat_name: continue
             if cat_name.lower() == "total":
-                if t_pct>=70: lvl_cell.value="Level 2"; lvl_cell.fill=lv2_f; lvl_cell.font=lv2_ft
-                elif t_pct>=40: lvl_cell.value="Level 1"; lvl_cell.fill=lv1_f; lvl_cell.font=lv1_ft
+                if t_level=="Level 2": lvl_cell.value="Level 2"; lvl_cell.fill=lv2_f; lvl_cell.font=lv2_ft
+                elif t_level=="Level 1": lvl_cell.value="Level 1"; lvl_cell.fill=lv1_f; lvl_cell.font=lv1_ft
                 else: lvl_cell.value="Below Level 1"; lvl_cell.fill=bl1_f; lvl_cell.font=bl1_ft
                 lvl_cell.alignment=ctr2; continue
             lvl_cell = row[4]
@@ -612,14 +775,14 @@ def export_excel():
             if matched and matched in results:
                 cd = results[matched]
                 imp = cd.get("implemented",0); tot = cd.get("total",0)
-                pct = round((imp/tot)*100) if tot else 0
+                pct, cat_level = compute_weighted_score(cd.get("reqs", []))
                 # Override Excel formula cells with our mapped values
                 row[1].value = imp   # Valid criteria (our mapped count)
                 row[2].value = tot   # Total criteria (our mapped total)
-                row[3].value = round(pct, 2)  # Our percentage
-                if pct>=70:
+                row[3].value = round(pct, 2)  # Our Level-weighted percentage
+                if cat_level=="Level 2":
                     lvl_cell.value="Level 2"; lvl_cell.fill=lv2_f; lvl_cell.font=lv2_ft
-                elif pct>=40:
+                elif cat_level=="Level 1":
                     lvl_cell.value="Level 1"; lvl_cell.fill=lv1_f; lvl_cell.font=lv1_ft
                 else:
                     lvl_cell.value="Below Level 1"; lvl_cell.fill=bl1_f; lvl_cell.font=bl1_ft
@@ -652,6 +815,7 @@ def export_pdf():
         data = request.json
         results = data.get('categoryResults', {})
         project = data.get('project_name', 'ASVS Analysis')
+        ai_insights = data.get('ai_insights')  # real Claude output from the UI's AI assessment, if it ran
         buf = io.BytesIO()
 
         doc = SimpleDocTemplate(buf, pagesize=A4,
@@ -691,11 +855,10 @@ def export_pdf():
         now = datetime.datetime.now().strftime("%d %B %Y  %H:%M")
         total_found = sum(cd.get("implemented",0) for cd in results.values())
         total_reqs  = sum(cd.get("total",0) for cd in results.values())
-        overall     = round((total_found/total_reqs)*100) if total_reqs else 0
-        lvl         = "Level 3" if overall>=80 else "Level 2" if overall>=50 else "Level 1" if overall>=20 else "Below Level 1"
-        lvl_color   = GREEN if overall>=70 else AMBER if overall>=40 else RED
+        all_reqs_flat = [r for cd in results.values() for r in cd.get("reqs", [])]
+        overall, lvl = compute_weighted_score(all_reqs_flat)
+        lvl_color   = GREEN if lvl=="Level 2" else AMBER if lvl=="Level 1" else RED
         cats_active = len([c for c in results if results[c].get("implemented",0)>0])
-        ai_score = overall  # AI score matches overall coverage %
 
         # COVER BANNER
         banner = Table([
@@ -741,7 +904,7 @@ def export_pdf():
              Paragraph(str(total_reqs),  S("n",fontSize=26,fontName="Helvetica-Bold",textColor=NAVY,alignment=TA_CENTER)),
              Paragraph(str(overall)+"%", S("n",fontSize=26,fontName="Helvetica-Bold",textColor=lvl_color,alignment=TA_CENTER)),
              Paragraph(lvl,              S("n",fontSize=14,fontName="Helvetica-Bold",textColor=lvl_color,alignment=TA_CENTER)),
-             Paragraph(str(cats_active)+"/11", S("n",fontSize=26,fontName="Helvetica-Bold",textColor=BLUE,alignment=TA_CENTER))],
+             Paragraph(str(cats_active)+"/"+str(len(results)), S("n",fontSize=26,fontName="Helvetica-Bold",textColor=BLUE,alignment=TA_CENTER))],
             [Paragraph("Controls Found",small_s),
              Paragraph("Total Requirements",small_s),
              Paragraph("Coverage",small_s),
@@ -777,20 +940,43 @@ def export_pdf():
         # AI ASSESSMENT SECTION
         story.append(HRFlowable(width="100%",thickness=1,color=LBLUE))
         story.append(Spacer(1,0.2*cm))
-        story.append(Paragraph("AI Security Assessment", h1_s))
 
+        has_real_ai = bool(ai_insights and ai_insights.get("summary"))
 
-        strengths, risks, recs = [], [], []
-        for cat, cd in sorted(results.items(), key=lambda x:x[1].get("pct",0), reverse=True):
-            if cd.get("implemented",0)>0:
-                ctrl = next((r for r in cd.get("reqs",[]) if r.get("implemented") and r.get("finding")),None)
-                if ctrl:
-                    strengths.append(cat+": "+ctrl["finding"].get("note","Detected")[:70])
-            if cd.get("pct",0)<40:
-                gap = next((r for r in cd.get("reqs",[]) if not r.get("implemented")),None)
-                if gap:
-                    risks.append(cat+": "+gap.get("requirement",""))
-                    recs.append(gap.get("requirement",""))
+        if has_real_ai:
+            # Real Claude assessment, passed through from the UI as-is — same
+            # data shown in the "Claude AI Security Assessment" panel on screen.
+            section_title = "Claude AI Security Assessment"
+            ai_score = ai_insights.get("securityScore", overall)
+            ai_summary = ai_insights.get("summary", "")
+            str_items  = (ai_insights.get("strengths") or [])[:6] or ["No strengths reported"]
+            risk_items = (ai_insights.get("risks") or [])[:6] or ["No risks reported"]
+            rec_items  = (ai_insights.get("topRecommendations") or [])[:6] or ["No recommendations reported"]
+        else:
+            # Fallback: no real AI assessment was supplied (not run, or it failed)
+            # — approximate from the pattern-matching results and say so plainly.
+            section_title = "Pattern-Based Security Summary (AI assessment unavailable)"
+            ai_score = overall
+            strengths, risks, recs = [], [], []
+            for cat, cd in sorted(results.items(), key=lambda x:x[1].get("pct",0), reverse=True):
+                if cd.get("implemented",0)>0:
+                    ctrl = next((r for r in cd.get("reqs",[]) if r.get("implemented") and r.get("finding")),None)
+                    if ctrl:
+                        strengths.append(cat+": "+ctrl["finding"].get("note","Detected")[:70])
+                if cd.get("pct",0)<40:
+                    gap = next((r for r in cd.get("reqs",[]) if not r.get("implemented")),None)
+                    if gap:
+                        risks.append(cat+": "+gap.get("requirement",""))
+                        recs.append(gap.get("requirement",""))
+            ai_summary = ("No Claude AI assessment was available for this export — this section is derived "
+                "directly from pattern-matching coverage, not an independent review. The codebase shows "
+                +str(total_found)+" ASVS 5.0 controls detected across "+str(cats_active)+" of 11 categories. "
+                + ("Strong pattern coverage in "+", ".join(top_cats[:3])+". " if top_cats else ""))
+            str_items = strengths[:4] if strengths else ["Pattern detection identified implemented controls"]
+            risk_items = [r.split(": ",1)[-1][:85] if ": " in r else r[:85] for r in risks[:4]] or ["Review undetected categories"]
+            rec_items  = [r.split("] ",1)[-1][:85] if "] " in r else r[:85] for r in recs[:4]]  or ["Improve low-coverage categories"]
+
+        story.append(Paragraph(section_title, h1_s))
 
         ai_top = Table([[
             Paragraph("Security Analysis — ASVS Compliance & Maturity Analyzer", S("ah",fontSize=12,fontName="Helvetica-Bold",textColor=BLUE)),
@@ -808,10 +994,6 @@ def export_pdf():
         ]))
         story.append(ai_top)
 
-        ai_summary = ("The codebase shows "+str(total_found)+" ASVS 5.0 controls across "+str(cats_active)+" of 11 categories. "
-            + ("Strong implementations in "+", ".join(top_cats[:3])+". " if top_cats else "")
-            + "Semantic analysis identifies "+str(len(risks))+" priority remediation areas. "
-            "JWT token expiry, secrets management, and certificate verification require attention.")
         ai_sum_t = Table([[Paragraph(ai_summary, body_s)]], colWidths=[17*cm])
         ai_sum_t.setStyle(TableStyle([
             ("BACKGROUND",(0,0),(-1,-1),LLBLUE),
@@ -838,12 +1020,8 @@ def export_pdf():
             ]))
             return t
 
-        str_items = strengths[:4] if strengths else ["Pattern detection identified implemented controls"]
-        risk_items = [r.split(": ",1)[-1][:85] if ": " in r else r[:85] for r in risks[:4]] or ["Review undetected categories"]
-        rec_items  = [r.split("] ",1)[-1][:85] if "] " in r else r[:85] for r in recs[:4]]  or ["Improve low-coverage categories"]
-
         ai_cols = Table([[
-            ai_col("Strengths Detected", str_items, GREEN, colors.HexColor("#F0FFF0")),
+            ai_col("Strengths", str_items, GREEN, colors.HexColor("#F0FFF0")),
             ai_col("Security Risks",     risk_items, RED,   colors.HexColor("#FFF5F5")),
             ai_col("Recommendations",    rec_items,  AMBER, colors.HexColor("#FFFDF0")),
         ]], colWidths=[5.6*cm,5.6*cm,5.6*cm])
@@ -883,9 +1061,9 @@ def export_pdf():
         ]
         for i,(cat,cd) in enumerate(results.items(),1):
             imp=cd.get("implemented",0); tot=cd.get("total",0)
-            pct=round((imp/tot)*100) if tot else 0
-            status="Level 2" if pct>=70 else "Level 1" if pct>=40 else "Below L1"
-            sc=GREEN if pct>=70 else AMBER if pct>=40 else RED
+            pct, status = compute_weighted_score(cd.get("reqs", []))
+            status = "Below L1" if status=="Below Level 1" else status
+            sc=GREEN if status=="Level 2" else AMBER if status=="Level 1" else RED
             bg=LLBLUE if i%2==0 else WHITE
             top = next((r for r in cd.get("reqs",[]) if r.get("implemented") and r.get("finding")),None)
             gap = next((r for r in cd.get("reqs",[]) if not r.get("implemented")),None)
@@ -1138,8 +1316,8 @@ def export_pdf():
 
         for cat,cd in results.items():
             reqs=cd.get("reqs",[]); imp=cd.get("implemented",0); tot=cd.get("total",0)
-            pct=round((imp/tot)*100) if tot else 0
-            cc=GREEN if pct>=70 else BLUE if pct>=40 else RED
+            pct, cat_level_banner = compute_weighted_score(reqs)
+            cc=GREEN if cat_level_banner=="Level 2" else BLUE if cat_level_banner=="Level 1" else RED
             cbanner=Table([[
                 Paragraph("<b>"+cat.replace("&","&amp;")+"</b>",S("cb",fontSize=11,fontName="Helvetica-Bold",textColor=WHITE)),
                 Paragraph(str(imp)+"/"+str(tot)+"  ("+str(pct)+"%)",
@@ -1181,13 +1359,13 @@ def export_pdf():
                 elif done:
                     note = f.get("note","Control detected")[:80]
                 else:
-                    note = remed.get(req.get("id",""),"Implement per ASVS 5.0 — see owasp.org")[:80]
+                    note = remed.get(req.get("id",""), "Implement: " + req.get("requirement","Review ASVS 5.0.0 spec for this requirement"))[:100]
                 nc=GREEN if done else GRAY
                 bg=LLBLUE if i%2==0 else WHITE
                 rrows.append([
                     Paragraph(req.get("id",""),   S("ri",fontSize=8,fontName="Helvetica-Bold",textColor=BLUE,alignment=TA_CENTER)),
                     Paragraph(req.get("level",""),S("rl",fontSize=8,fontName="Helvetica",alignment=TA_CENTER)),
-                    Paragraph((req.get("requirement","")[:120] + f" [CWE-{req.get('cwe','')}]").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"),S("rr",fontSize=8,fontName="Helvetica",leading=11)),
+                    Paragraph((req.get("requirement","")[:120] + f" [Level {req.get('level','')} | {req.get('verificationMethod','SAST')}]").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"),S("rr",fontSize=8,fontName="Helvetica",leading=11)),
                     Paragraph("<b>Pass</b>" if done else "<b>Fail</b>",
                         S("rs",fontSize=8,fontName="Helvetica-Bold",textColor=GREEN if done else RED,alignment=TA_CENTER)),
                     Paragraph(str(note).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"),S("rf",fontSize=7.5,fontName="Helvetica",textColor=nc,leading=10)),
