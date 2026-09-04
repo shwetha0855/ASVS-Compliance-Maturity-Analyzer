@@ -91,6 +91,98 @@ AI_INSIGHTS_SCHEMA = {
     "additionalProperties": False
 }
 
+# ══════════════════════════════════════════════════════════════════════════
+#  CLAUDE AI PER-REQUIREMENT REMEDIATION — OUTPUT CONTRACT
+#  Takes a batch of gap requirements and returns specific, contextual fix
+#  suggestions for each, instead of the static remediation_map fallback.
+# ══════════════════════════════════════════════════════════════════════════
+REMEDIATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "remediations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "reqId": {"type": "string", "description": "The ASVS requirement ID this remediation is for"},
+                    "suggestion": {"type": "string", "description": "One or two short, plain-language sentences on how to fix this gap"},
+                    "codeSnippet": {"type": "string", "description": "A short, concrete code example implementing the fix, in the detected language"}
+                },
+                "required": ["reqId", "suggestion", "codeSnippet"],
+                "additionalProperties": False
+            }
+        }
+    },
+    "required": ["remediations"],
+    "additionalProperties": False
+}
+
+@app.route('/api/ai/remediate', methods=['POST'])
+def ai_remediate():
+    if not USE_CLAUDE_AI:
+        return jsonify({
+            "ok": True,
+            "remediations": [],
+            "aiDisabled": True,
+            "note": "AI remediation disabled during development (USE_CLAUDE_AI=false). Falling back to static guidance."
+        })
+
+    client = get_anthropic_client()
+    if client is None:
+        return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY is not configured on the server."}), 503
+
+    data = request.json or {}
+    gaps = data.get('gaps', [])  # [{ "id": "...", "requirement": "...", "language": "..." }, ...]
+    language = data.get('language') or 'source'
+
+    if not gaps:
+        return jsonify({"ok": True, "remediations": []})
+
+    gaps = gaps[:20]
+
+    gap_list = "\n".join(
+        f"- {g.get('id','')}: {g.get('requirement','')[:200]}" for g in gaps
+    )
+
+    user_content = (
+        f"Language: {language}\n\n"
+        f"The following ASVS 5.0.0 requirements were NOT detected as implemented in the scanned code. "
+        f"For each one, provide a short, specific, actionable fix suggestion and a concrete code snippet "
+        f"showing the fix in {language}.\n\n{gap_list}"
+    )
+
+    try:
+        response = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=4000,
+            output_config={"effort": "low", "format": {"type": "json_schema", "schema": REMEDIATION_SCHEMA}},
+            system=(
+                "You are a security engineer writing remediation guidance for developers. "
+                "Be specific and concrete — reference real function/library names for the given language "
+                "where applicable. Keep suggestions short and code snippets minimal but runnable in context."
+            ),
+            messages=[{"role": "user", "content": user_content}],
+        )
+    except anthropic.APIStatusError as e:
+        return jsonify({"ok": False, "error": f"Claude API error: {e.message}"}), 502
+    except anthropic.APIConnectionError:
+        return jsonify({"ok": False, "error": "Could not reach the Claude API"}), 502
+
+    if response.stop_reason == "refusal":
+        return jsonify({"ok": False, "error": "The remediation request was declined by the model"}), 502
+
+    text = next((b.text for b in response.content if b.type == "text"), None)
+    if not text:
+        return jsonify({"ok": False, "error": "Model returned no remediation"}), 502
+
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        return jsonify({"ok": False, "error": "Model returned a malformed response"}), 502
+
+    result["ok"] = True
+    return jsonify(result)
+
 @app.route('/api/ai/analyze', methods=['POST'])
 def ai_analyze():
     if not USE_CLAUDE_AI:
