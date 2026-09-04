@@ -362,6 +362,7 @@ def export_excel():
 
     data = request.json
     results = data.get('categoryResults', {})
+    ai_remediations = data.get('aiRemediations', {})
 
     TEMPLATE = '/home/kali/asvs-compliance-maturity-analyzer/ASVS-checklist-5.0.0.xlsx'
     if not os.path.exists(TEMPLATE):
@@ -636,6 +637,9 @@ def export_excel():
             req_id = str(row[1].value).strip() if row[1].value else ""
             if not req_id or req_id in ["None","nan",""]:
                 continue
+            verification_method = str(row[3].value).strip() if row[3].value else "SAST"
+            if verification_method != "SAST":
+                continue  # DAST/Manual rows keep the template'''s pre-filled "Not Tested" styling untouched
             req = req_map.get(req_id)
             implemented = req.get("implemented", False) if req else False
             finding = req.get("finding", {}) if req else {}
@@ -698,7 +702,14 @@ def export_excel():
                 valid_cell.fill  = fail_fill
                 valid_cell.font  = fail_font
                 valid_cell.alignment = ctr_align
-                src_cell.value = remediation_map.get(req_id, "Implement: " + (req.get("requirement", "Review ASVS 5.0.0 spec for this requirement") if req else "Review ASVS 5.0.0 spec for this requirement"))
+                ai_rem = ai_remediations.get(req_id)
+                if ai_rem:
+                    src_cell.value = ai_rem.get("suggestion","") + " | Example: " + ai_rem.get("codeSnippet","")[:200]
+                else:
+                    # NOTE: remediation_map intentionally NOT used here — its keys use the old
+                    # pre-5.0.0 ASVS numbering, which collides with different, unrelated
+                    # requirements under the corrected 5.0.0 scheme, producing wrong guidance.
+                    src_cell.value = "Implement: " + (req.get("requirement", "Review ASVS 5.0.0 spec for this requirement") if req else "Review ASVS 5.0.0 spec for this requirement")
                 src_cell.alignment = lft_align
                 unique_comments = {
                     "2.1.1":"Add min length validation to registration handler",
