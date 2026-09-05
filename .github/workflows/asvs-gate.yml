@@ -26,7 +26,7 @@ jobs:
       - name: Run ASVS Compliance Scan
         id: scan
         run: |
-          node cli.js --path . --min-level "Level 1" --project "${{ github.repository }}" | tee scan_output.txt
+          node cli.js --path ./ci-test-target/AI-Powered-ASVS-Analyzer-main --min-level "Level 1" --project "${{ github.repository }}" | tee scan_output.txt
         continue-on-error: true
 
       - name: Post results as PR comment
