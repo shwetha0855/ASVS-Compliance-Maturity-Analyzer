@@ -787,6 +787,8 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiInsights, setAiInsights] = useState(null);
+  const [aiRemediations, setAiRemediations] = useState({});
+  const [remediationsReady, setRemediationsReady] = useState(true);
   const [selectedCat, setSelectedCat] = useState(null);
   const [filterLevel, setFilterLevel] = useState("all");
   const [expanded, setExpanded] = useState({});
@@ -922,6 +924,34 @@ export default function App() {
       setAiInsights({ error: "Could not reach the AI analysis service — is the backend running?" });
     }
     setAiLoading(false);
+
+    // Fetch specific, AI-generated remediation for each gap (SAST-verifiable, not implemented)
+    setRemediationsReady(false);
+    try {
+      const gaps = Object.values(res.categoryResults)
+        .flatMap(d => d.reqs)
+        .filter(r => !r.implemented)
+        .map(r => ({ id: r.id, requirement: r.requirement }));
+      const gapLanguage = res.language
+        || (files.some(f => f.name?.endsWith('.py')) ? 'python'
+          : files.some(f => f.name?.endsWith('.js') || f.name?.endsWith('.jsx')) ? 'javascript'
+          : 'source');
+      if (gaps.length) {
+        const remRes = await fetch(`${API}/ai/remediate`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ gaps, language: gapLanguage })
+        });
+        const remData = await remRes.json();
+        if (remData.ok && remData.remediations) {
+          const map = {};
+          for (const r of remData.remediations) map[r.reqId] = r;
+          setAiRemediations(map);
+        }
+      }
+    } catch (e) {
+      console.error("AI remediation fetch failed, falling back to static guidance:", e);
+    }
+    setRemediationsReady(true);
   }, [files, user, projectName]);
 
   const exportExcel = async () => {
@@ -929,7 +959,7 @@ export default function App() {
     try {
       const res = await fetch(`${API}/export/excel`, {
         method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ categoryResults: results.categoryResults, project_name: projectName })
+        body: JSON.stringify({ categoryResults: results.categoryResults, project_name: projectName, aiRemediations })
       });
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -1162,7 +1192,7 @@ export default function App() {
 
             {/* Export buttons */}
             <div style={{ display:"flex", gap:10, justifyContent:"flex-end" }}>
-              <button onClick={exportExcel} style={{ padding:"9px 18px", borderRadius:8, border:"none", background:"linear-gradient(135deg,#1a6b3a,#2ea043)", color:"#fff", fontWeight:700, fontSize:12, cursor:"pointer" }}>📥 Export Excel</button>
+              <button onClick={exportExcel} disabled={!remediationsReady} style={{ padding:"9px 18px", borderRadius:8, border:"none", background: remediationsReady ? "linear-gradient(135deg,#1a6b3a,#2ea043)" : "#a0a0a0", color:"#fff", fontWeight:700, fontSize:12, cursor: remediationsReady ? "pointer" : "not-allowed" }}>{remediationsReady ? "📥 Export Excel" : "⏳ Preparing remediation..."}</button>
               <button onClick={exportPDF} style={{ padding:"9px 18px", borderRadius:8, border:"none", background:"linear-gradient(135deg,#6b1a1a,#c0392b)", color:"#fff", fontWeight:700, fontSize:12, cursor:"pointer" }}>📄 Export PDF</button>
             </div>
 

@@ -1,0 +1,52 @@
+ASVS DEMO DETECTOR CHECKLIST
+
+AST / regex constructs intentionally included:
+11.4.2 bcrypt.hash
+11.4.4 saltRounds
+6.3.1 rateLimit
+6.2.12 haveibeenpwned
+6.5.3 crypto.randomBytes
+6.5.8 speakeasy.totp.verify
+7.2.4 session.regenerate
+7.4.1 session.destroy
+9.1.1 jwt.sign
+9.1.2 stateless JWT + algorithms
+9.1.3 jwt.verify
+9.2.3 audience option
+3.3.1 secure:true
+3.3.2 sameSite:"strict"
+3.3.3 __Host- cookie
+3.3.4 httpOnly:true
+3.4.1 HSTS
+3.4.3 CSP
+3.4.5 Referrer-Policy
+3.4.6 X-Frame-Options
+8.2.1 authorize()
+8.2.2 resource owner check
+1.2.1 escapeHtml
+1.2.4 parameterized query
+1.2.5 shell:false
+1.3.6 ALLOWED_HOSTS.includes
+1.5.2 JSON.parse
+2.2.1 validator
+11.3.2 aes-256-gcm
+11.3.4 IV/nonce
+11.5.1 randomBytes
+14.2.3 encryptSensitiveData
+14.3.3 localStorage.removeItem/sessionStorage.clear
+5.2.1 file.size comparison
+5.3.2 path.basename
+5.3.1 UPLOAD_FOLDER
+5.4.1 sanitizeFilename
+5.4.3 clamscan.scan
+4.3.2 introspection:false
+4.3.1 depthLimit()
+13.4.2 debug:false / NODE_ENV production
+13.4.3 autoIndex:false
+13.4.4 TRACE comparison
+13.2.4 ALLOWED_RESOURCES
+15.4.1 Mutex
+16.2.4 winston.createLogger
+16.3.2 logger.warn/error
+16.5.3 try/catch
+16.5.4 process.on("uncaughtException")
