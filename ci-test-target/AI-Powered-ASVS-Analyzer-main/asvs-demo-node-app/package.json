@@ -1,0 +1,21 @@
+{
+  "name": "asvs-demo-secure-node-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Small Node.js/Express application intentionally structured to exercise the ASVS Compliance & Maturity Analyzer detectors.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "express-session": "^1.18.1",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "speakeasy": "^2.0.0",
+    "winston": "^3.17.0"
+  }
+}
